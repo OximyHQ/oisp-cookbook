@@ -1,0 +1,12 @@
+{
+  "name": "nvm-node-edge-case",
+  "version": "1.0.0",
+  "description": "Edge case example for NVM-installed Node.js with OISP Sensor",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "openai": "^4.0.0"
+  }
+}

@@ -1,0 +1,40 @@
+# Docker Compose for Python + OpenAI + OISP Sensor
+#
+# This runs both the sensor and the Python app together.
+# The sensor captures all SSL traffic from the app container.
+
+services:
+  # OISP Sensor - captures AI API calls
+  sensor:
+    image: ghcr.io/oximyhq/oisp-sensor:latest
+    privileged: true  # Required for eBPF
+    pid: "host"       # Required to see app processes
+    volumes:
+      - ./output:/output
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+    command: >
+      record
+      --output /output/events.jsonl
+      --no-web
+      --process python
+    healthcheck:
+      test: ["CMD", "test", "-f", "/output/events.jsonl"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # Python app - makes OpenAI API calls
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      sensor:
+        condition: service_healthy
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    network_mode: "host"  # Share network with host for sensor visibility
+    volumes:
+      - ./output:/output
+

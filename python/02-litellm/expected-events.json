@@ -1,0 +1,25 @@
+{
+  "$schema": "https://oisp.dev/cookbook/expected-events.schema.json",
+  "description": "LiteLLM unified API call to OpenAI",
+  "minimum_events": 2,
+  "events": [
+    {
+      "event_type": "ai.request",
+      "required_fields": {
+        "data.provider.name": "openai",
+        "data.model.id": "/gpt-4o.*/",
+        "data.streaming": false,
+        "data.request_type": "chat"
+      }
+    },
+    {
+      "event_type": "ai.response",
+      "required_fields": {
+        "data.success": true,
+        "data.usage.prompt_tokens": "> 0",
+        "data.usage.completion_tokens": "> 0",
+        "data.usage.total_tokens": "> 0"
+      }
+    }
+  ]
+}

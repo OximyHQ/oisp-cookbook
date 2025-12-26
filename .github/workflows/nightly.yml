@@ -1,0 +1,158 @@
+# Nightly Test Suite
+#
+# Runs all examples every night to ensure the sensor works with real APIs.
+# This is our source of truth for "does OISP actually work?"
+
+name: Nightly Tests
+
+on:
+  schedule:
+    # Run at 2 AM UTC every day
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      sensor_version:
+        description: 'Sensor version to test (default: latest)'
+        required: false
+        default: 'latest'
+
+env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+jobs:
+  # Download sensor once, share with all jobs
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      sensor-version: ${{ steps.download.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download OISP Sensor
+        id: download
+        run: |
+          VERSION="${{ github.event.inputs.sensor_version || 'latest' }}"
+          ./shared/scripts/download-sensor.sh $VERSION
+          echo "version=$(./bin/oisp-sensor --version | head -1)" >> $GITHUB_OUTPUT
+
+      - name: Upload sensor binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: oisp-sensor
+          path: bin/oisp-sensor
+          retention-days: 1
+
+  # Test matrix - each example runs in parallel
+  test-matrix:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example:
+          - name: python-01-openai-simple
+            path: python/01-openai-simple
+          - name: python-02-litellm
+            path: python/02-litellm
+          - name: python-03-langchain-agent
+            path: python/03-langchain-agent
+          - name: python-04-fastapi-service
+            path: python/04-fastapi-service
+          - name: node-01-openai-simple
+            path: node/01-openai-simple
+          - name: self-hosted-n8n
+            path: self-hosted/n8n
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download sensor binary
+        uses: actions/download-artifact@v4
+        with:
+          name: oisp-sensor
+          path: bin/
+
+      - name: Make sensor executable
+        run: chmod +x bin/oisp-sensor
+
+      - name: Setup Python
+        if: startsWith(matrix.example.path, 'python/')
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node.js
+        if: startsWith(matrix.example.path, 'node/')
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run ${{ matrix.example.name }}
+        env:
+          OISP_SENSOR_BIN: ${{ github.workspace }}/bin/oisp-sensor
+        run: |
+          cd ${{ matrix.example.path }}
+          chmod +x test.sh
+          ./test.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.example.name }}
+          path: ${{ matrix.example.path }}/output/
+          retention-days: 7
+
+  # Kubernetes tests (separate job - requires k3d)
+  test-kubernetes:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python (for validation)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+      - name: Run kubernetes/daemonset test
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          cd kubernetes/daemonset
+          chmod +x test.sh
+          ./test.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-kubernetes-daemonset
+          path: kubernetes/daemonset/output/
+          retention-days: 7
+
+  # Summary report
+  report:
+    needs: [setup, test-matrix, test-kubernetes]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## Nightly Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Sensor Version:** ${{ needs.setup.outputs.sensor-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Time:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See individual job results above for details." >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Tests failed! Consider adding Slack/Discord notification here."
+

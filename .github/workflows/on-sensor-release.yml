@@ -1,0 +1,94 @@
+# Sensor Release Validation
+#
+# Triggered by oisp-sensor when a new release is created.
+# Validates that the new release works with all examples.
+
+name: Release Validation
+
+on:
+  repository_dispatch:
+    types: [sensor-release]
+  workflow_dispatch:
+    inputs:
+      sensor_version:
+        description: 'Sensor version to test'
+        required: true
+        default: 'latest'
+
+env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example:
+          # Core examples that must pass for any release
+          - python/01-openai-simple
+          - node/01-openai-simple
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get sensor version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            VERSION="${{ github.event.client_payload.version }}"
+          else
+            VERSION="${{ github.event.inputs.sensor_version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Testing sensor version: $VERSION"
+
+      - name: Download sensor
+        run: |
+          ./shared/scripts/download-sensor.sh ${{ steps.version.outputs.version }}
+
+      - name: Setup Python
+        if: startsWith(matrix.example, 'python/')
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node.js
+        if: startsWith(matrix.example, 'node/')
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run test
+        env:
+          OISP_SENSOR_BIN: ${{ github.workspace }}/bin/oisp-sensor
+        run: |
+          cd ${{ matrix.example }}
+          chmod +x test.sh
+          ./test.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.example }}
+          path: ${{ matrix.example }}/output/
+
+  report-back:
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'repository_dispatch'
+    steps:
+      - name: Report success
+        if: success()
+        run: |
+          echo "All validation tests passed for ${{ github.event.client_payload.version }}"
+          # TODO: Could update a status check on the sensor repo
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "Validation failed for ${{ github.event.client_payload.version }}"
+          # TODO: Could create an issue or notify
+

@@ -1,0 +1,26 @@
+# Docker Compose for E2E testing with local sensor build
+#
+# IMPORTANT: eBPF uprobes do NOT work on macOS Docker (OrbStack/Docker Desktop).
+# The uprobe mechanism requires native Linux. Use one of:
+#   - GitHub Actions (Linux runners)
+#   - A real Linux VM (UTM, Parallels, etc.)
+#   - Native Linux machine
+#
+# Usage (on Linux):
+#   export OPENAI_API_KEY=sk-...
+#   docker compose -f docker-compose.test.yml up --build
+
+services:
+  test:
+    build:
+      context: ../../../  # Root of oisp monorepo
+      dockerfile: oisp-cookbook/python/01-openai-simple/Dockerfile.test
+    privileged: true  # Required for eBPF
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./output:/output
+      - /sys/kernel/debug:/sys/kernel/debug:rw  # Must be rw for uprobe registration!
+      - /sys/fs/bpf:/sys/fs/bpf
+    # pid: host  # Alternative: use host PID namespace (may help on some systems)
+

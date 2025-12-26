@@ -1,0 +1,12 @@
+{
+  "name": "oisp-cookbook-node-openai",
+  "version": "1.0.0",
+  "description": "Simple Node.js + OpenAI example for OISP testing",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "openai": "^4.0.0"
+  }
+}

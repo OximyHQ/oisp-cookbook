@@ -1,0 +1,44 @@
+# OISP Cookbook .gitignore
+
+# Sensor binary (downloaded, not committed)
+bin/
+*.sensor
+
+# Secrets file for local testing with act
+.secrets
+.env
+
+# Output directories (generated during tests)
+**/output/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.Python
+*.egg-info/
+dist/
+build/
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Docker
+.docker/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://oisp.dev/cookbook/expected-events.schema.json",
+  "description": "FastAPI service making AI API calls",
+  "minimum_events": 4,
+  "events": [
+    {
+      "event_type": "ai.request",
+      "required_fields": {
+        "data.provider.name": "openai",
+        "data.model.id": "/gpt-4o.*/",
+        "data.streaming": false,
+        "data.request_type": "chat"
+      }
+    },
+    {
+      "event_type": "ai.response",
+      "required_fields": {
+        "data.success": true,
+        "data.usage.prompt_tokens": "> 0",
+        "data.usage.completion_tokens": "> 0"
+      }
+    },
+    {
+      "event_type": "ai.request",
+      "required_fields": {
+        "data.provider.name": "openai",
+        "data.request_type": "chat"
+      }
+    },
+    {
+      "event_type": "ai.response",
+      "required_fields": {
+        "data.success": true
+      }
+    }
+  ]
+}

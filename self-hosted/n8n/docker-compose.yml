@@ -1,0 +1,49 @@
+# Docker Compose for n8n + OISP Sensor
+#
+# This runs n8n alongside the OISP sensor to capture AI API calls
+# from n8n workflows.
+
+services:
+  # OISP Sensor - captures AI API calls
+  sensor:
+    image: ghcr.io/oximyhq/oisp-sensor:latest
+    privileged: true  # Required for eBPF
+    pid: "host"       # Required to see app processes
+    volumes:
+      - ./output:/output
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+    command: >
+      record
+      --output /output/events.jsonl
+      --no-web
+      --process node
+    healthcheck:
+      test: ["CMD", "test", "-f", "/output/events.jsonl"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # n8n - workflow automation
+  n8n:
+    image: n8nio/n8n:latest
+    depends_on:
+      sensor:
+        condition: service_healthy
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=false
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Skip setup wizard for automated testing
+      - N8N_SKIP_OWNER_SETUP=true
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./output:/output
+    network_mode: "host"
+
+volumes:
+  n8n_data:

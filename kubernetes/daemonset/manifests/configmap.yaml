@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oisp-sensor-config
+  namespace: oisp-sensor
+  labels:
+    app.kubernetes.io/name: oisp-sensor
+data:
+  # Sensor configuration
+  # See https://docs.oisp.dev/configuration for all options
+  config.yaml: |
+    # Output configuration
+    output:
+      format: jsonl
+      path: /output/events.jsonl
+
+    # Filtering
+    filters:
+      # Only capture AI-related traffic
+      ai_only: true
+
+    # Redaction settings (optional)
+    redaction:
+      enabled: false
+      # patterns:
+      #   - "sk-[a-zA-Z0-9]+"

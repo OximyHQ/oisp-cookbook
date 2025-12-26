@@ -100,9 +100,13 @@ echo ""
 echo "Running Python app..."
 python app.py
 
-# Wait for events to be captured
+# Wait for events to be captured (including ai.response which comes after HTTP response is fully received)
 echo ""
 "$WAIT_SCRIPT" "$EVENTS_FILE" 2 30
+
+# Give sensor more time to process and emit ai.response
+# The ai.response is generated after decompressing gzipped chunked response
+sleep 5
 
 # Stop sensor gracefully
 echo ""

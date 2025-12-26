@@ -103,6 +103,9 @@ python app.py || true
 echo ""
 "$WAIT_SCRIPT" "$EVENTS_FILE" 4 60
 
+# Give sensor more time to process and emit ai.response
+sleep 5
+
 # Stop sensor gracefully
 echo ""
 echo "Stopping sensor..."

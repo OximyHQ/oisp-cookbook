@@ -33,7 +33,6 @@ spec:
             - record
             - --output
             - /output/events.jsonl
-            - --no-web
 
           # Security context for eBPF
           securityContext:
@@ -74,25 +73,29 @@ spec:
               mountPath: /etc/oisp-sensor
               readOnly: true
 
-          # Liveness probe
-          livenessProbe:
-            exec:
-              command:
-                - test
-                - -f
-                - /output/events.jsonl
-            initialDelaySeconds: 10
-            periodSeconds: 30
-
-          # Readiness probe
+          # Readiness probe - check if sensor process is running
+          # Note: We check for the process, not the output file, since events.jsonl
+          # only appears after traffic is captured
           readinessProbe:
             exec:
               command:
-                - test
+                - pgrep
                 - -f
-                - /output/events.jsonl
+                - oisp-sensor
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
+
+          # Liveness probe - check process is still alive
+          livenessProbe:
+            exec:
+              command:
+                - pgrep
+                - -f
+                - oisp-sensor
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
 
       volumes:
         # Output directory - using hostPath for simplicity

@@ -40,8 +40,8 @@ jobs:
       - name: Discover cookbooks with Dockerfile.test
         id: discover
         run: |
-          # Find all cookbooks with Dockerfile.test (excludes kubernetes which has its own test)
-          COOKBOOKS=$(find . -name "Dockerfile.test" -not -path "./kubernetes/*" \
+          # Find all cookbooks with Dockerfile.test (including kubernetes now)
+          COOKBOOKS=$(find . -name "Dockerfile.test" \
             -exec dirname {} \; | sed 's|^\./||' | sort | \
             jq -R -s -c 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})')
           echo "cookbooks=$COOKBOOKS" >> $GITHUB_OUTPUT
@@ -118,51 +118,9 @@ jobs:
           path: output/
           retention-days: 7
 
-  # Kubernetes tests (separate job - requires k3d)
-  test-kubernetes:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout cookbook repo
-        uses: actions/checkout@v4
-        with:
-          path: oisp-cookbook
-
-      - name: Checkout sensor repo
-        uses: actions/checkout@v4
-        with:
-          repository: OximyHQ/oisp-sensor
-          ref: ${{ github.event.inputs.sensor_ref || 'main' }}
-          path: oisp-sensor
-          submodules: recursive
-
-      - name: Setup Python (for validation)
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install k3d
-        run: |
-          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
-
-      - name: Run kubernetes/daemonset test
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          cd oisp-cookbook/kubernetes/daemonset
-          chmod +x test.sh
-          ./test.sh
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-kubernetes-daemonset
-          path: oisp-cookbook/kubernetes/daemonset/output/
-          retention-days: 7
-
   # Summary report
   report:
-    needs: [discover, test-matrix, test-kubernetes]
+    needs: [discover, test-matrix]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -179,4 +137,3 @@ jobs:
         if: failure()
         run: |
           echo "Tests failed! Consider adding Slack/Discord notification here."
-

@@ -10,6 +10,7 @@ resources:
   # Uncomment to deploy test app:
   # - test-app.yaml
 
-commonLabels:
-  app.kubernetes.io/managed-by: kustomize
-  app.kubernetes.io/part-of: oisp
+labels:
+  - pairs:
+      app.kubernetes.io/managed-by: kustomize
+      app.kubernetes.io/part-of: oisp

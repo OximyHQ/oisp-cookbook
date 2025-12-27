@@ -1,0 +1,338 @@
+# Test Dockerfile for Kubernetes DaemonSet deployment
+#
+# This test builds the sensor, creates a k3d cluster inside Docker,
+# deploys the DaemonSet, runs a test app, and validates captured events.
+#
+# Uses Docker-in-Docker (DinD) to run k3d inside the container.
+#
+# Prerequisites:
+#   Clone with submodules: git clone --recurse-submodules <repo>
+#   Or init after clone: git submodule update --init --recursive
+
+# =============================================================================
+# Stage 1: Build sslsniff (libbpf-based C binary)
+# =============================================================================
+FROM debian:bookworm-slim AS libbpf-builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    clang \
+    llvm \
+    libelf-dev \
+    zlib1g-dev \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY oisp-sensor/bpftool ./bpftool
+COPY oisp-sensor/bpf ./bpf
+COPY oisp-sensor/vmlinux ./vmlinux
+
+RUN cd bpftool/src && make -j$(nproc)
+
+WORKDIR /build/bpf
+RUN LIBBPF_SRC=/build/bpftool/libbpf/src \
+    BPFTOOL_SRC=/build/bpftool/src \
+    VMLINUX_DIR=/build/vmlinux \
+    make clean && \
+    LIBBPF_SRC=/build/bpftool/libbpf/src \
+    BPFTOOL_SRC=/build/bpftool/src \
+    VMLINUX_DIR=/build/vmlinux \
+    make sslsniff && \
+    cp sslsniff /usr/local/bin/
+
+# =============================================================================
+# Stage 2: Build Rust sensor with embedded sslsniff
+# =============================================================================
+FROM rust:latest AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    lld \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=libbpf-builder /usr/local/bin/sslsniff /usr/local/bin/sslsniff
+
+WORKDIR /build
+COPY oisp-sensor/ ./
+
+RUN mkdir -p frontend/out && echo '<!DOCTYPE html><html><body>Stub</body></html>' > frontend/out/index.html
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    RUSTFLAGS="-C link-arg=-fuse-ld=lld" \
+    cargo build --release -p oisp-sensor --no-default-features --features tui && \
+    cp target/release/oisp-sensor /usr/local/bin/oisp-sensor
+
+# =============================================================================
+# Stage 3: Build sensor Docker image (for k3d import)
+# =============================================================================
+FROM debian:trixie-slim AS sensor-image
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    libelf1 \
+    zlib1g \
+    openssl \
+    procps \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash -u 1000 oisp
+
+COPY --from=builder /usr/local/bin/oisp-sensor /usr/local/bin/
+
+RUN mkdir -p /var/lib/oisp /var/log/oisp /etc/oisp && \
+    chown -R oisp:oisp /var/lib/oisp /var/log/oisp
+
+ENTRYPOINT ["oisp-sensor"]
+CMD ["record", "--output", "/output/events.jsonl"]
+
+# =============================================================================
+# Stage 4: Test runner with Docker-in-Docker + k3d
+# =============================================================================
+FROM docker:24-dind
+
+# Install dependencies
+RUN apk add --no-cache \
+    bash \
+    curl \
+    jq \
+    python3 \
+    py3-pip \
+    git
+
+# Install kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
+    chmod +x kubectl && \
+    mv kubectl /usr/local/bin/
+
+# Install k3d
+RUN curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+# Copy sensor binary for reference
+COPY --from=builder /usr/local/bin/oisp-sensor /usr/local/bin/
+
+# Copy test files
+WORKDIR /test
+COPY oisp-cookbook/kubernetes/daemonset/manifests/ ./manifests/
+COPY oisp-cookbook/kubernetes/daemonset/expected-events.json .
+COPY --chmod=755 oisp-cookbook/shared/scripts/validate.py /scripts/
+
+# We need to save the sensor image and load it into k3d
+# Create a script to export the sensor image from the build stage
+COPY --from=sensor-image / /sensor-rootfs/
+
+# Test script
+COPY <<'EOF' /test/run-test.sh
+#!/bin/bash
+set -e
+
+echo "=== OISP Kubernetes DaemonSet E2E Test ==="
+echo ""
+
+# Create output dir
+mkdir -p /output
+
+# Check prerequisites
+echo "Checking prerequisites..."
+echo "kubectl version: $(kubectl version --client -o json | jq -r '.clientVersion.gitVersion')"
+echo "k3d version: $(k3d version | head -1)"
+echo ""
+
+# Check API key
+if [ -z "$OPENAI_API_KEY" ]; then
+    echo "ERROR: OPENAI_API_KEY not set"
+    exit 1
+fi
+
+# Docker should already be ready (started in entrypoint)
+echo "Docker status:"
+docker info 2>/dev/null | grep -E "(Server Version|Storage Driver)" || echo "Docker not available"
+echo ""
+
+# Build sensor image from the rootfs we copied
+echo "Building sensor image for k3d..."
+cat > /tmp/Dockerfile.sensor << 'DOCKERFILE'
+FROM scratch
+COPY . /
+ENTRYPOINT ["oisp-sensor"]
+CMD ["record", "--output", "/output/events.jsonl"]
+DOCKERFILE
+
+docker build -t oisp-sensor:test-local -f /tmp/Dockerfile.sensor /sensor-rootfs/
+
+echo "Sensor image built successfully"
+docker images oisp-sensor:test-local
+echo ""
+
+# Create k3d cluster
+CLUSTER_NAME="oisp-test-$$"
+echo "Creating k3d cluster: $CLUSTER_NAME"
+k3d cluster create "$CLUSTER_NAME" --wait
+
+# Cleanup on exit
+cleanup() {
+    echo ""
+    echo "Cleaning up..."
+    k3d cluster delete "$CLUSTER_NAME" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Import sensor image into k3d
+echo "Importing sensor image into k3d..."
+k3d image import oisp-sensor:test-local -c "$CLUSTER_NAME"
+echo ""
+
+# Patch daemonset to use local image
+echo "Generating DaemonSet manifest with local image..."
+sed 's|ghcr.io/oximyhq/oisp-sensor:latest|oisp-sensor:test-local|g; s/imagePullPolicy: Always/imagePullPolicy: Never/g' \
+    manifests/daemonset.yaml > /tmp/daemonset-local.yaml
+
+# Deploy manifests
+echo "Deploying namespace and config..."
+kubectl apply -f manifests/namespace.yaml
+kubectl apply -f manifests/configmap.yaml
+
+echo "Deploying sensor DaemonSet..."
+kubectl apply -f /tmp/daemonset-local.yaml
+
+# Wait for sensor to be ready
+echo "Waiting for sensor pods (timeout: 120s)..."
+if ! kubectl wait --for=condition=ready pod -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor --timeout=120s; then
+    echo "ERROR: Sensor pod failed to become ready"
+    echo "Pod status:"
+    kubectl get pods -n oisp-sensor -o wide
+    echo "Pod description:"
+    kubectl describe pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor
+    echo "Pod logs:"
+    kubectl logs -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor --tail=50 || true
+    exit 1
+fi
+
+echo "Sensor pod is ready!"
+echo ""
+
+# Create API key secret
+echo "Creating API key secret..."
+kubectl create secret generic openai-api-key \
+    -n oisp-sensor \
+    --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY"
+
+# Deploy test application
+echo "Deploying test application..."
+kubectl apply -f manifests/test-app.yaml
+
+# Wait for test app to complete
+echo "Waiting for test app to complete (timeout: 180s)..."
+if ! kubectl wait --for=condition=complete job/test-app -n oisp-sensor --timeout=180s; then
+    echo "ERROR: Test app job failed or timed out"
+    echo "Job status:"
+    kubectl get jobs -n oisp-sensor
+    echo "Pod status:"
+    kubectl get pods -n oisp-sensor -l app.kubernetes.io/name=test-app
+    echo "Test app logs:"
+    kubectl logs -n oisp-sensor -l app.kubernetes.io/name=test-app --tail=50 || true
+    exit 1
+fi
+
+echo "Test app completed!"
+echo ""
+
+# Wait for sensor to process events
+echo "Waiting for sensor to process events..."
+sleep 10
+
+# Extract events from sensor pod
+echo "Extracting captured events..."
+SENSOR_POD=$(kubectl get pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor -o jsonpath='{.items[0].metadata.name}')
+
+if ! kubectl cp "oisp-sensor/$SENSOR_POD:/output/events.jsonl" /output/events.jsonl 2>/dev/null; then
+    echo "No events file yet, checking sensor status..."
+    echo "Sensor logs:"
+    kubectl logs -n oisp-sensor "$SENSOR_POD" --tail=30 || true
+    echo "Output directory contents:"
+    kubectl exec -n oisp-sensor "$SENSOR_POD" -- ls -la /output/ 2>/dev/null || true
+    touch /output/events.jsonl
+fi
+
+# Show what was captured
+echo ""
+echo "Events captured:"
+if [ -s /output/events.jsonl ]; then
+    wc -l /output/events.jsonl
+    head -5 /output/events.jsonl
+else
+    echo "(no events captured)"
+fi
+
+# Show sensor logs
+echo ""
+echo "=== Sensor Logs ==="
+kubectl logs -n oisp-sensor "$SENSOR_POD" --tail=30 || echo "(no logs)"
+echo "=== End Sensor Logs ==="
+echo ""
+
+# Validate events
+echo "Validating captured events..."
+python3 /scripts/validate.py /output/events.jsonl expected-events.json
+RESULT=$?
+
+echo ""
+if [ $RESULT -eq 0 ]; then
+    echo "=== TEST PASSED ==="
+else
+    echo "=== TEST FAILED ==="
+    echo ""
+    echo "All captured events:"
+    cat /output/events.jsonl 2>/dev/null || echo "(none)"
+    echo ""
+    echo "Test app logs:"
+    kubectl logs -n oisp-sensor -l app.kubernetes.io/name=test-app --tail=30 || true
+fi
+
+exit $RESULT
+EOF
+
+RUN chmod +x /test/run-test.sh
+
+# The entrypoint starts dockerd and then runs our test
+COPY <<'ENTRYPOINT' /entrypoint.sh
+#!/bin/bash
+set -e
+
+# Start Docker daemon in background, redirect logs to file
+dockerd-entrypoint.sh > /var/log/docker.log 2>&1 &
+
+# Wait for docker socket to be available
+echo "Waiting for Docker daemon to start..."
+for i in $(seq 1 60); do
+    if [ -S /var/run/docker.sock ]; then
+        # Socket exists, wait a bit more for daemon to be fully ready
+        sleep 2
+        if docker info >/dev/null 2>&1; then
+            echo "Docker daemon is ready! (took ${i}s)"
+            break
+        fi
+    fi
+    if [ "$i" -eq 60 ]; then
+        echo "ERROR: Docker daemon failed to start after 60s"
+        echo "=== Docker logs ==="
+        cat /var/log/docker.log
+        exit 1
+    fi
+    sleep 1
+done
+
+# Run our test
+exec /test/run-test.sh
+ENTRYPOINT
+
+RUN chmod +x /entrypoint.sh
+
+CMD ["/entrypoint.sh"]

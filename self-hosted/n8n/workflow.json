@@ -1,5 +1,7 @@
 {
+  "id": "oisp-test-workflow",
   "name": "OISP Test Workflow",
+  "active": false,
   "nodes": [
     {
       "parameters": {},

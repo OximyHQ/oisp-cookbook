@@ -47,15 +47,45 @@ kubectl get pods -n oisp-sensor
 kubectl exec -it -n oisp-sensor $(kubectl get pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor -o jsonpath='{.items[0].metadata.name}') -- cat /output/events.jsonl
 ```
 
-### Run Full Test with k3d
+### Run Full Test (Recommended)
+
+The recommended way to test uses the standard `test-all.sh` script:
+
+```bash
+cd /path/to/oisp-cookbook
+
+# Set your API key
+export OPENAI_API_KEY=sk-...
+
+# Run the kubernetes test
+./test-all.sh kubernetes/daemonset
+```
+
+This builds a Docker container that runs k3d internally (Docker-in-Docker), so you don't need k3d installed locally.
+
+### Alternative: Run test.sh with local k3d
+
+If you have k3d installed locally:
 
 ```bash
 # Set your API key
 export OPENAI_API_KEY=sk-...
 
-# Run automated test (creates temporary cluster)
-make test
+# Point to oisp-sensor source
+export SENSOR_DIR=/path/to/oisp-sensor
+
+# Run test directly
+./test.sh
 ```
+
+The test will:
+1. Build the sensor Docker image from source
+2. Create a temporary k3d cluster
+3. Import the image into the cluster
+4. Deploy the sensor DaemonSet
+5. Run a test application that makes OpenAI API calls
+6. Validate that the sensor captured the expected events
+7. Clean up the cluster
 
 ## Manifest Files
 
@@ -153,7 +183,7 @@ Ensure your cluster allows privileged containers. For managed Kubernetes:
 | File | Description |
 |------|-------------|
 | `manifests/` | Kubernetes manifest files |
+| `Dockerfile.test` | Docker-in-Docker test (used by test-all.sh) |
 | `expected-events.json` | Event validation schema |
-| `test.sh` | Automated test script |
-| `Makefile` | Development commands |
+| `test.sh` | Local test script (requires k3d) |
 | `README.md` | This file |

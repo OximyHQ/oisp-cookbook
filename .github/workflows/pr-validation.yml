@@ -17,6 +17,12 @@ on:
       - 'shared/**'
       - '.github/workflows/**'
 
+# Minimal permissions for security
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
 env:
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

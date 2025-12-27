@@ -1,7 +1,7 @@
 # Sensor Release Validation
 #
 # Triggered by oisp-sensor when a new release is created.
-# Validates that the new release works with all examples.
+# Validates that the new release works with ALL cookbooks (strict quality gate).
 
 name: Release Validation
 
@@ -25,16 +25,11 @@ env:
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
 jobs:
-  validate:
+  # Download and cache sensor version
+  setup:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        example:
-          # Core examples that must pass for any release
-          - python/01-openai-simple
-          - node/01-openai-simple
-
+    outputs:
+      sensor-version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -53,47 +48,94 @@ jobs:
         run: |
           ./shared/scripts/download-sensor.sh ${{ steps.version.outputs.version }}
 
+      - name: Upload sensor binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: oisp-sensor
+          path: bin/oisp-sensor
+          retention-days: 1
+
+  # Auto-discover all cookbooks
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      cookbooks: ${{ steps.discover.outputs.cookbooks }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Discover cookbooks
+        id: discover
+        run: |
+          # Generate JSON array for matrix - test ALL cookbooks on release
+          COOKBOOKS=$(./shared/scripts/discover-cookbooks.sh | \
+            jq -R -s -c 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})')
+          echo "cookbooks=$COOKBOOKS" >> $GITHUB_OUTPUT
+
+          echo "Release validation will test ALL cookbooks:"
+          echo "$COOKBOOKS" | jq -r '.[].path'
+
+  # Test all cookbooks with new sensor version
+  validate:
+    needs: [setup, discover]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # Test all cookbooks, report all failures
+      matrix:
+        cookbook: ${{ fromJson(needs.discover.outputs.cookbooks) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download sensor binary
+        uses: actions/download-artifact@v4
+        with:
+          name: oisp-sensor
+          path: bin/
+
+      - name: Make sensor executable
+        run: chmod +x bin/oisp-sensor
+
       - name: Setup Python
-        if: startsWith(matrix.example, 'python/')
+        if: startsWith(matrix.cookbook.path, 'python/')
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Setup Node.js
-        if: startsWith(matrix.example, 'node/')
+        if: startsWith(matrix.cookbook.path, 'node/')
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Run test
+      - name: Run ${{ matrix.cookbook.name }}
         env:
           OISP_SENSOR_BIN: ${{ github.workspace }}/bin/oisp-sensor
         run: |
-          cd ${{ matrix.example }}
-          chmod +x test.sh
-          ./test.sh
+          ./shared/scripts/run-cookbook-test.sh ${{ matrix.cookbook.path }}
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ matrix.example }}
-          path: ${{ matrix.example }}/output/
+          name: logs-${{ matrix.cookbook.name }}
+          path: ${{ matrix.cookbook.path }}/output/
+          retention-days: 7
 
+  # Report results back to sensor repo
   report-back:
-    needs: validate
+    needs: [setup, validate]
     runs-on: ubuntu-latest
-    if: github.event_name == 'repository_dispatch'
+    if: always() && github.event_name == 'repository_dispatch'
     steps:
       - name: Report success
-        if: success()
+        if: needs.validate.result == 'success'
         run: |
-          echo "All validation tests passed for ${{ github.event.client_payload.version }}"
-          # TODO: Could update a status check on the sensor repo
+          echo "✅ All cookbook tests passed for sensor ${{ needs.setup.outputs.sensor-version }}"
+          # TODO: Update status check on sensor repo using GitHub API
 
       - name: Report failure
-        if: failure()
+        if: needs.validate.result != 'success'
         run: |
-          echo "Validation failed for ${{ github.event.client_payload.version }}"
-          # TODO: Could create an issue or notify
-
+          echo "❌ Cookbook validation failed for sensor ${{ needs.setup.outputs.sensor-version }}"
+          # TODO: Create issue or notify team
+          exit 1

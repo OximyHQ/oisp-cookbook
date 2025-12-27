@@ -60,14 +60,13 @@ jobs:
         id: discover
         run: |
           # Generate JSON array for matrix
-          ./shared/scripts/discover-cookbooks.sh | \
-            jq -R -s 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})' \
-            > cookbooks.json
-          echo "cookbooks=$(cat cookbooks.json)" >> $GITHUB_OUTPUT
+          COOKBOOKS=$(./shared/scripts/discover-cookbooks.sh | \
+            jq -R -s -c 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})')
+          echo "cookbooks=$COOKBOOKS" >> $GITHUB_OUTPUT
 
           # Show discovered cookbooks
           echo "Discovered cookbooks:"
-          cat cookbooks.json | jq -r '.[].path'
+          echo "$COOKBOOKS" | jq -r '.[].path'
 
   # Test matrix - each cookbook runs in parallel
   test-matrix:

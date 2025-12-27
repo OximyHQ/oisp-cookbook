@@ -1,0 +1,71 @@
+# Docker Compose for Python + Celery + OpenAI + OISP Sensor
+#
+# This demonstrates OISP capturing AI calls from multiple Celery workers.
+# All workers' OpenAI API calls are captured by the sensor.
+
+services:
+  # Redis - Celery message broker
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  # OISP Sensor - captures AI API calls from all processes
+  sensor:
+    image: ghcr.io/oximyhq/oisp-sensor:latest
+    privileged: true  # Required for eBPF
+    pid: "host"       # Required to see all processes
+    volumes:
+      - ./output:/output
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+    command: >
+      record
+      --output /output/events.jsonl
+      --no-web
+    healthcheck:
+      test: ["CMD", "test", "-f", "/output/events.jsonl"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # Celery workers (multiple processes)
+  worker:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      sensor:
+        condition: service_healthy
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    network_mode: "host"  # Share network for sensor visibility
+    deploy:
+      replicas: 2  # Run 2 worker containers
+    command: >
+      celery -A tasks worker
+      --loglevel=info
+      --concurrency=1
+      --hostname=worker@%h
+
+  # Task submitter (runs app.py)
+  submitter:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    network_mode: "host"
+    volumes:
+      - ./output:/output
+    command: python app.py

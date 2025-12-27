@@ -1,0 +1,201 @@
+# Test Dockerfile - Builds oisp-sensor with embedded sslsniff
+#
+# Single binary with embedded sslsniff for best UX.
+# sslsniff is extracted and run automatically at runtime.
+#
+# Prerequisites:
+#   Clone with submodules: git clone --recurse-submodules <repo>
+#   Or init after clone: git submodule update --init --recursive
+
+# =============================================================================
+# Stage 1: Build sslsniff (libbpf-based C binary)
+# =============================================================================
+FROM debian:bookworm-slim AS libbpf-builder
+
+# Install build dependencies for libbpf and sslsniff
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    clang \
+    llvm \
+    libelf-dev \
+    zlib1g-dev \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy bpftool submodule (includes libbpf as nested submodule)
+# - bpftool: https://github.com/libbpf/bpftool @ 5b402ff
+# - libbpf (nested): https://github.com/libbpf/libbpf @ 7a6e6b4
+COPY oisp-sensor/bpftool ./bpftool
+
+# Copy our sslsniff source and vmlinux headers
+COPY oisp-sensor/bpf ./bpf
+COPY oisp-sensor/vmlinux ./vmlinux
+
+# Build bpftool first (this also builds libbpf)
+RUN cd bpftool/src && make -j$(nproc)
+
+# Build sslsniff with paths pointing to bpftool's nested libbpf
+WORKDIR /build/bpf
+RUN LIBBPF_SRC=/build/bpftool/libbpf/src \
+    BPFTOOL_SRC=/build/bpftool/src \
+    VMLINUX_DIR=/build/vmlinux \
+    make clean && \
+    LIBBPF_SRC=/build/bpftool/libbpf/src \
+    BPFTOOL_SRC=/build/bpftool/src \
+    VMLINUX_DIR=/build/vmlinux \
+    make sslsniff && \
+    cp sslsniff /usr/local/bin/
+
+# =============================================================================
+# Stage 2: Build Rust sensor with embedded sslsniff
+# =============================================================================
+FROM rust:latest AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    lld \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy sslsniff from libbpf-builder stage
+COPY --from=libbpf-builder /usr/local/bin/sslsniff /usr/local/bin/sslsniff
+
+# Copy oisp-sensor source
+WORKDIR /build
+COPY oisp-sensor/ ./
+
+# Build oisp-sensor with cache mounts and lld linker
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    RUSTFLAGS="-C link-arg=-fuse-ld=lld" \
+    cargo build --release -p oisp-sensor && \
+    cp target/release/oisp-sensor /usr/local/bin/oisp-sensor
+
+# Verify sslsniff was embedded
+RUN ls -la /usr/local/bin/oisp-sensor
+
+# =============================================================================
+# Stage 3: Runtime
+# =============================================================================
+FROM python:slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libelf1 \
+    zlib1g \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the single binary
+COPY --from=builder /usr/local/bin/oisp-sensor /usr/local/bin/
+
+# Setup Python app
+WORKDIR /app
+COPY oisp-cookbook/python/04-fastapi-service/requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+COPY oisp-cookbook/python/04-fastapi-service/app.py .
+COPY oisp-cookbook/python/04-fastapi-service/expected-events.json .
+COPY --chmod=755 oisp-cookbook/shared/scripts/validate.py /scripts/
+
+# Test script
+COPY <<'EOF' /app/run-test.sh
+#!/bin/bash
+set -e
+
+echo "=== OISP Sensor E2E Test (FastAPI Service) ==="
+echo ""
+
+# Create output dir
+mkdir -p /output
+
+# Check sensor
+echo "Sensor version:"
+oisp-sensor --version
+echo ""
+
+# Run system check
+echo "System check:"
+oisp-sensor check || true
+echo ""
+
+# Start sensor (sslsniff is embedded and auto-extracted)
+echo "Starting sensor..."
+oisp-sensor record \
+    --output /output/events.jsonl \
+    > /output/sensor.log 2>&1 &
+SENSOR_PID=$!
+
+# Wait for sensor to initialize
+sleep 5
+
+if ! kill -0 $SENSOR_PID 2>/dev/null; then
+    echo "ERROR: Sensor failed to start"
+    cat /output/sensor.log
+    exit 1
+fi
+
+echo "Sensor running (PID: $SENSOR_PID)"
+echo ""
+
+# Make FastAPI service API calls
+echo "Making FastAPI service API calls..."
+python app.py
+echo ""
+
+# Wait for events
+echo "Waiting for events..."
+sleep 5
+
+# Stop sensor
+echo "Stopping sensor..."
+kill -TERM $SENSOR_PID 2>/dev/null || true
+sleep 2
+
+# Show sensor log
+echo ""
+echo "=== Sensor Log ==="
+cat /output/sensor.log || echo "(no log)"
+echo "=== End Sensor Log ==="
+echo ""
+
+# Show captured events
+echo "Captured events:"
+if [ -f /output/events.jsonl ] && [ -s /output/events.jsonl ]; then
+    cat /output/events.jsonl
+    EVENT_COUNT=$(wc -l < /output/events.jsonl)
+    echo ""
+    echo "Total events: $EVENT_COUNT"
+else
+    echo "(no events captured)"
+    echo ""
+    echo "=== TEST FAILED ==="
+    echo "No events captured. Check sensor log above."
+    exit 1
+fi
+echo ""
+
+# Validate
+echo "Validating..."
+python /scripts/validate.py /output/events.jsonl expected-events.json
+RESULT=$?
+
+echo ""
+if [ $RESULT -eq 0 ]; then
+    echo "=== TEST PASSED ==="
+else
+    echo "=== TEST FAILED ==="
+fi
+
+exit $RESULT
+EOF
+
+RUN chmod +x /app/run-test.sh
+
+CMD ["/app/run-test.sh"]

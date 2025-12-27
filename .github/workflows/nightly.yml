@@ -43,26 +43,35 @@ jobs:
           path: bin/oisp-sensor
           retention-days: 1
 
-  # Test matrix - each example runs in parallel
+  # Auto-discover cookbooks
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      cookbooks: ${{ steps.discover.outputs.cookbooks }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Discover cookbooks
+        id: discover
+        run: |
+          # Generate JSON array for matrix
+          ./shared/scripts/discover-cookbooks.sh | \
+            jq -R -s 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})' \
+            > cookbooks.json
+          echo "cookbooks=$(cat cookbooks.json)" >> $GITHUB_OUTPUT
+
+          # Show discovered cookbooks
+          echo "Discovered cookbooks:"
+          cat cookbooks.json | jq -r '.[].path'
+
+  # Test matrix - each cookbook runs in parallel
   test-matrix:
-    needs: setup
+    needs: [setup, discover]
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: false  # Run all tests, report all failures (strict policy)
       matrix:
-        example:
-          - name: python-01-openai-simple
-            path: python/01-openai-simple
-          - name: python-02-litellm
-            path: python/02-litellm
-          - name: python-03-langchain-agent
-            path: python/03-langchain-agent
-          - name: python-04-fastapi-service
-            path: python/04-fastapi-service
-          - name: node-01-openai-simple
-            path: node/01-openai-simple
-          - name: self-hosted-n8n
-            path: self-hosted/n8n
+        cookbook: ${{ fromJson(needs.discover.outputs.cookbooks) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -77,31 +86,29 @@ jobs:
         run: chmod +x bin/oisp-sensor
 
       - name: Setup Python
-        if: startsWith(matrix.example.path, 'python/')
+        if: startsWith(matrix.cookbook.path, 'python/')
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Setup Node.js
-        if: startsWith(matrix.example.path, 'node/')
+        if: startsWith(matrix.cookbook.path, 'node/')
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Run ${{ matrix.example.name }}
+      - name: Run ${{ matrix.cookbook.name }}
         env:
           OISP_SENSOR_BIN: ${{ github.workspace }}/bin/oisp-sensor
         run: |
-          cd ${{ matrix.example.path }}
-          chmod +x test.sh
-          ./test.sh
+          ./shared/scripts/run-cookbook-test.sh ${{ matrix.cookbook.path }}
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ matrix.example.name }}
-          path: ${{ matrix.example.path }}/output/
+          name: logs-${{ matrix.cookbook.name }}
+          path: ${{ matrix.cookbook.path }}/output/
           retention-days: 7
 
   # Kubernetes tests (separate job - requires k3d)

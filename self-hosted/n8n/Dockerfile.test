@@ -1,0 +1,278 @@
+# Test Dockerfile for n8n with OISP Sensor
+#
+# This test runs n8n and the OISP sensor in a single container to verify
+# that AI API calls from n8n workflows are captured correctly.
+#
+# Prerequisites:
+#   Clone with submodules: git clone --recurse-submodules <repo>
+#   Or init after clone: git submodule update --init --recursive
+
+# =============================================================================
+# Stage 1: Build sslsniff (libbpf-based C binary)
+# =============================================================================
+FROM debian:bookworm-slim AS libbpf-builder
+
+# Install build dependencies for libbpf and sslsniff
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    clang \
+    llvm \
+    libelf-dev \
+    zlib1g-dev \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy bpftool submodule (includes libbpf as nested submodule)
+COPY oisp-sensor/bpftool ./bpftool
+
+# Copy our sslsniff source and vmlinux headers
+COPY oisp-sensor/bpf ./bpf
+COPY oisp-sensor/vmlinux ./vmlinux
+
+# Build bpftool first (this also builds libbpf)
+RUN cd bpftool/src && make -j$(nproc)
+
+# Build sslsniff with paths pointing to bpftool's nested libbpf
+WORKDIR /build/bpf
+RUN LIBBPF_SRC=/build/bpftool/libbpf/src \
+    BPFTOOL_SRC=/build/bpftool/src \
+    VMLINUX_DIR=/build/vmlinux \
+    make clean && \
+    LIBBPF_SRC=/build/bpftool/libbpf/src \
+    BPFTOOL_SRC=/build/bpftool/src \
+    VMLINUX_DIR=/build/vmlinux \
+    make sslsniff && \
+    cp sslsniff /usr/local/bin/
+
+# =============================================================================
+# Stage 2: Build Rust sensor with embedded sslsniff
+# =============================================================================
+FROM rust:1-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    lld \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy sslsniff from libbpf-builder stage
+COPY --from=libbpf-builder /usr/local/bin/sslsniff /usr/local/bin/sslsniff
+
+# Copy oisp-sensor source
+WORKDIR /build
+COPY oisp-sensor/ ./
+
+# Build oisp-sensor with cache mounts and lld linker
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    RUSTFLAGS="-C link-arg=-fuse-ld=lld" \
+    cargo build --release -p oisp-sensor && \
+    cp target/release/oisp-sensor /usr/local/bin/oisp-sensor
+
+# =============================================================================
+# Stage 3: Runtime - n8n with OISP Sensor
+# =============================================================================
+FROM n8nio/n8n:latest
+
+USER root
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libelf1 \
+    zlib1g \
+    bash \
+    curl \
+    jq \
+    python3 \
+    python3-pip \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy oisp-sensor binary
+COPY --from=builder /usr/local/bin/oisp-sensor /usr/local/bin/
+
+# Copy test files
+WORKDIR /app
+COPY oisp-cookbook/self-hosted/n8n/workflow.json .
+COPY oisp-cookbook/self-hosted/n8n/expected-events.json .
+COPY --chmod=755 oisp-cookbook/shared/scripts/validate.py /scripts/
+COPY --chmod=755 oisp-cookbook/shared/scripts/wait-for-events.sh /scripts/
+
+# Test script
+COPY <<'EOF' /app/run-test.sh
+#!/bin/bash
+set -e
+
+echo "=== OISP Sensor E2E Test (n8n Self-Hosted) ==="
+echo ""
+
+# Create output dir
+mkdir -p /output
+
+# Check sensor
+echo "Sensor version:"
+oisp-sensor --version || echo "Warning: sensor check failed"
+echo ""
+
+# Start n8n in background
+echo "Starting n8n..."
+export N8N_BASIC_AUTH_ACTIVE=false
+export N8N_SKIP_OWNER_SETUP=true
+export N8N_HOST=localhost
+export N8N_PORT=5678
+export N8N_PROTOCOL=http
+
+# Start n8n as background process
+su node -c "n8n start" > /output/n8n.log 2>&1 &
+N8N_PID=$!
+
+# Wait for n8n to be ready
+echo "Waiting for n8n to be ready..."
+N8N_URL="http://localhost:5678"
+for i in {1..60}; do
+    if curl -s "${N8N_URL}/healthz" 2>/dev/null | grep -q "ok"; then
+        echo "n8n is ready!"
+        break
+    fi
+    if [ $i -eq 60 ]; then
+        echo "ERROR: n8n failed to start"
+        cat /output/n8n.log
+        exit 1
+    fi
+    echo "  ... waiting ($i/60)"
+    sleep 2
+done
+
+# Start sensor (sslsniff is embedded and auto-extracted)
+echo ""
+echo "Starting OISP Sensor..."
+oisp-sensor record \
+    --output /output/events.jsonl \
+    > /output/sensor.log 2>&1 &
+SENSOR_PID=$!
+
+# Wait for sensor to initialize
+sleep 5
+
+if ! kill -0 $SENSOR_PID 2>/dev/null; then
+    echo "ERROR: Sensor failed to start"
+    cat /output/sensor.log
+    exit 1
+fi
+
+echo "Sensor running (PID: $SENSOR_PID)"
+echo ""
+
+# Create OpenAI credentials
+echo "Setting up OpenAI credentials..."
+if [ -z "$OPENAI_API_KEY" ]; then
+    echo "ERROR: OPENAI_API_KEY not set"
+    exit 1
+fi
+
+CRED_RESPONSE=$(curl -s -X POST "${N8N_URL}/api/v1/credentials" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"name\": \"OpenAI API\",
+        \"type\": \"openAiApi\",
+        \"data\": {
+            \"apiKey\": \"${OPENAI_API_KEY}\"
+        }
+    }")
+
+CRED_ID=$(echo "$CRED_RESPONSE" | jq -r '.id // "1"')
+echo "Credential ID: $CRED_ID"
+
+# Import workflow
+echo ""
+echo "Importing test workflow..."
+# Update workflow with credential ID
+WORKFLOW=$(cat workflow.json | sed "s/openai-cred/${CRED_ID}/g")
+WORKFLOW_RESPONSE=$(curl -s -X POST "${N8N_URL}/api/v1/workflows" \
+    -H "Content-Type: application/json" \
+    -d "$WORKFLOW")
+
+WORKFLOW_ID=$(echo "$WORKFLOW_RESPONSE" | jq -r '.id')
+if [ -z "$WORKFLOW_ID" ] || [ "$WORKFLOW_ID" = "null" ]; then
+    echo "ERROR: Could not import workflow"
+    echo "$WORKFLOW_RESPONSE"
+    exit 1
+fi
+echo "Workflow ID: $WORKFLOW_ID"
+
+# Activate workflow
+echo "Activating workflow..."
+curl -s -X PATCH "${N8N_URL}/api/v1/workflows/${WORKFLOW_ID}" \
+    -H "Content-Type: application/json" \
+    -d '{"active": true}' > /dev/null
+
+# Execute workflow
+echo ""
+echo "Executing workflow..."
+EXEC_RESPONSE=$(curl -s -X POST "${N8N_URL}/api/v1/workflows/${WORKFLOW_ID}/run" \
+    -H "Content-Type: application/json" \
+    -d '{}')
+
+echo "Execution response:"
+echo "$EXEC_RESPONSE" | jq '.' 2>/dev/null || echo "$EXEC_RESPONSE"
+
+# Wait for events to be captured
+echo ""
+echo "Waiting for events to be captured..."
+/scripts/wait-for-events.sh /output/events.jsonl 2 60
+
+# Stop sensor
+echo ""
+echo "Stopping sensor..."
+kill -TERM $SENSOR_PID 2>/dev/null || true
+sleep 2
+
+# Show sensor log
+echo ""
+echo "=== Sensor Log ==="
+cat /output/sensor.log || echo "(no log)"
+echo "=== End Sensor Log ==="
+echo ""
+
+# Show captured events
+echo "Captured events:"
+if [ -f /output/events.jsonl ] && [ -s /output/events.jsonl ]; then
+    cat /output/events.jsonl
+    EVENT_COUNT=$(wc -l < /output/events.jsonl)
+    echo ""
+    echo "Total events: $EVENT_COUNT"
+else
+    echo "(no events captured)"
+    echo ""
+    echo "=== TEST FAILED ==="
+    echo "No events captured. Check sensor log above."
+    exit 1
+fi
+echo ""
+
+# Validate
+echo "Validating..."
+python3 /scripts/validate.py /output/events.jsonl expected-events.json
+RESULT=$?
+
+echo ""
+if [ $RESULT -eq 0 ]; then
+    echo "=== TEST PASSED ==="
+else
+    echo "=== TEST FAILED ==="
+fi
+
+# Cleanup
+kill $N8N_PID 2>/dev/null || true
+
+exit $RESULT
+EOF
+
+RUN chmod +x /app/run-test.sh
+
+CMD ["/app/run-test.sh"]

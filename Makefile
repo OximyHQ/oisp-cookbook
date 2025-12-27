@@ -11,7 +11,8 @@
 #   OPENAI_API_KEY     Required for OpenAI examples
 #   ANTHROPIC_API_KEY  Required for Anthropic examples
 
-.PHONY: all test test-python test-node test-self-hosted test-kubernetes test-edge-cases docker-test-all clean download-sensor help
+# Dynamic targets for individual cookbooks (e.g., make test-python-01-openai-simple)
+.PHONY: all test test-python test-node test-self-hosted test-kubernetes test-edge-cases docker-test-all clean download-sensor help $(addprefix test-,$(subst /,-,$(COOKBOOKS)))
 
 # Default sensor version to download
 SENSOR_VERSION ?= latest
@@ -19,14 +20,18 @@ SENSOR_VERSION ?= latest
 # Local sensor binary (use local build if set)
 OISP_SENSOR_BIN ?= ./bin/oisp-sensor
 
-# Examples to test
-PYTHON_EXAMPLES := python/01-openai-simple python/02-litellm python/03-langchain-agent python/04-fastapi-service
-NODE_EXAMPLES := node/01-openai-simple
-SELF_HOSTED_EXAMPLES := self-hosted/n8n
-KUBERNETES_EXAMPLES := kubernetes/daemonset
-EDGE_CASE_EXAMPLES := edge-cases/nvm-node edge-cases/pyenv-python
+# Auto-discover all cookbooks (any directory with expected-events.json)
+COOKBOOKS := $(shell ./shared/scripts/discover-cookbooks.sh 2>/dev/null || echo "")
 
-ALL_EXAMPLES := $(PYTHON_EXAMPLES) $(NODE_EXAMPLES) $(SELF_HOSTED_EXAMPLES)
+# For backward compatibility, categorize by path
+PYTHON_EXAMPLES := $(filter python/%,$(COOKBOOKS))
+NODE_EXAMPLES := $(filter node/%,$(COOKBOOKS))
+SELF_HOSTED_EXAMPLES := $(filter self-hosted/%,$(COOKBOOKS))
+KUBERNETES_EXAMPLES := $(filter kubernetes/%,$(COOKBOOKS))
+EDGE_CASE_EXAMPLES := $(filter edge-cases/%,$(COOKBOOKS))
+MULTI_PROCESS_EXAMPLES := $(filter multi-process/%,$(COOKBOOKS))
+
+ALL_EXAMPLES := $(COOKBOOKS)
 
 help:
 	@echo "OISP Cookbook - Examples and Validation Tests"
@@ -57,46 +62,50 @@ download-sensor:
 		echo "Using sensor binary: $(OISP_SENSOR_BIN)"; \
 	fi
 
-# Run a single example test
+# Pattern rule for individual cookbook tests (e.g., make test-python-01-openai-simple)
+test-%: download-sensor
+	@cookbook=$$(echo "$*" | sed 's/-/\//g'); \
+	echo "Testing $$cookbook..."; \
+	OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./shared/scripts/run-cookbook-test.sh "$$cookbook"
+
+# Run a single example test (backward compatibility)
 test-example: download-sensor
 ifndef EXAMPLE
 	$(error EXAMPLE is not set. Usage: make test-example EXAMPLE=python/01-openai-simple)
 endif
 	@echo "Testing $(EXAMPLE)..."
-	@cd $(EXAMPLE) && OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./test.sh
+	@OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./shared/scripts/run-cookbook-test.sh "$(EXAMPLE)"
 
-# Run all tests
+# Run all tests (strict policy - all must pass)
 test: download-sensor
-	@echo "Running all tests..."
+	@echo "Running all tests (discovered $(words $(COOKBOOKS)) cookbooks)..."
 	@failed=0; \
-	for example in $(ALL_EXAMPLES); do \
+	for cookbook in $(COOKBOOKS); do \
 		echo ""; \
-		echo "=== Testing $$example ==="; \
-		if cd $$example && OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./test.sh; then \
-			echo "[PASS] $$example"; \
+		echo "=== Testing $$cookbook ==="; \
+		if OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./shared/scripts/run-cookbook-test.sh "$$cookbook"; then \
+			echo "[PASS] $$cookbook"; \
 		else \
-			echo "[FAIL] $$example"; \
+			echo "[FAIL] $$cookbook"; \
 			failed=1; \
 		fi; \
-		cd $(CURDIR); \
 	done; \
 	exit $$failed
 
 # Run Python tests only
 test-python: download-sensor
-	@echo "Running Python tests..."
-	@for example in $(PYTHON_EXAMPLES); do \
-		echo "Testing $$example..."; \
-		cd $$example && OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./test.sh || exit 1; \
-		cd $(CURDIR); \
+	@echo "Running Python tests ($(words $(PYTHON_EXAMPLES)) cookbooks)..."
+	@for cookbook in $(PYTHON_EXAMPLES); do \
+		echo "Testing $$cookbook..."; \
+		OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./shared/scripts/run-cookbook-test.sh "$$cookbook" || exit 1; \
 	done
 
 # Run Node.js tests only
 test-node: download-sensor
-	@echo "Running Node.js tests..."
-	@for example in $(NODE_EXAMPLES); do \
-		echo "Testing $$example..."; \
-		cd $$example && OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./test.sh || exit 1; \
+	@echo "Running Node.js tests ($(words $(NODE_EXAMPLES)) cookbooks)..."
+	@for cookbook in $(NODE_EXAMPLES); do \
+		echo "Testing $$cookbook..."; \
+		OISP_SENSOR_BIN=$(abspath $(OISP_SENSOR_BIN)) ./shared/scripts/run-cookbook-test.sh "$$cookbook" || exit 1; \
 		cd $(CURDIR); \
 	done
 

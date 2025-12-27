@@ -1,0 +1,236 @@
+# Test Dockerfile - Builds oisp-sensor with embedded sslsniff
+#
+# This is an edge case test for pyenv-installed Python.
+# pyenv versions may use static OpenSSL linking which prevents SSL capture.
+#
+# Prerequisites:
+#   Clone with submodules: git clone --recurse-submodules <repo>
+#   Or init after clone: git submodule update --init --recursive
+
+# =============================================================================
+# Stage 1: Build sslsniff (libbpf-based C binary)
+# =============================================================================
+FROM debian:bookworm-slim AS libbpf-builder
+
+# Install build dependencies for libbpf and sslsniff
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    clang \
+    llvm \
+    libelf-dev \
+    zlib1g-dev \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy bpftool submodule (includes libbpf as nested submodule)
+# - bpftool: https://github.com/libbpf/bpftool @ 5b402ff
+# - libbpf (nested): https://github.com/libbpf/libbpf @ 7a6e6b4
+COPY oisp-sensor/bpftool ./bpftool
+
+# Copy our sslsniff source and vmlinux headers
+COPY oisp-sensor/bpf ./bpf
+COPY oisp-sensor/vmlinux ./vmlinux
+
+# Build bpftool first (this also builds libbpf)
+RUN cd bpftool/src && make -j$(nproc)
+
+# Build sslsniff with paths pointing to bpftool's nested libbpf
+WORKDIR /build/bpf
+RUN LIBBPF_SRC=/build/bpftool/libbpf/src \
+    BPFTOOL_SRC=/build/bpftool/src \
+    VMLINUX_DIR=/build/vmlinux \
+    make clean && \
+    LIBBPF_SRC=/build/bpftool/libbpf/src \
+    BPFTOOL_SRC=/build/bpftool/src \
+    VMLINUX_DIR=/build/vmlinux \
+    make sslsniff && \
+    cp sslsniff /usr/local/bin/
+
+# =============================================================================
+# Stage 2: Build Rust sensor with embedded sslsniff
+# =============================================================================
+FROM rust:1-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    lld \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy sslsniff from libbpf-builder stage
+COPY --from=libbpf-builder /usr/local/bin/sslsniff /usr/local/bin/sslsniff
+
+# Copy oisp-sensor source
+WORKDIR /build
+COPY oisp-sensor/ ./
+
+# Build oisp-sensor with cache mounts and lld linker
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    RUSTFLAGS="-C link-arg=-fuse-ld=lld" \
+    cargo build --release -p oisp-sensor && \
+    cp target/release/oisp-sensor /usr/local/bin/oisp-sensor
+
+# Verify sslsniff was embedded
+RUN ls -la /usr/local/bin/oisp-sensor
+
+# =============================================================================
+# Stage 3: Runtime - Install pyenv and Python
+# =============================================================================
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libelf1 \
+    zlib1g \
+    zlib1g-dev \
+    procps \
+    curl \
+    git \
+    ca-certificates \
+    build-essential \
+    libssl-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    libffi-dev \
+    liblzma-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the single binary
+COPY --from=builder /usr/local/bin/oisp-sensor /usr/local/bin/
+
+# Install pyenv
+ENV PYENV_ROOT=/root/.pyenv
+ENV PATH=$PYENV_ROOT/shims:$PYENV_ROOT/bin:$PATH
+ENV PYTHON_VERSION=3.12.1
+
+RUN curl https://pyenv.run | bash && \
+    PYTHON_CONFIGURE_OPTS="--without-ensurepip" pyenv install $PYTHON_VERSION && \
+    pyenv global $PYTHON_VERSION && \
+    pyenv rehash && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python
+
+# Setup Python app
+WORKDIR /app
+COPY oisp-cookbook/edge-cases/pyenv-python/requirements.txt .
+
+# Install dependencies using pyenv's Python
+RUN pip install -r requirements.txt
+
+COPY oisp-cookbook/edge-cases/pyenv-python/app.py .
+COPY oisp-cookbook/edge-cases/pyenv-python/expected-events.json .
+COPY --chmod=755 oisp-cookbook/shared/scripts/validate.py /scripts/
+
+# Test script
+COPY <<'EOF' /app/run-test.sh
+#!/bin/bash
+set -e
+
+echo "=== OISP Sensor E2E Test (pyenv Python Edge Case) ==="
+echo ""
+echo "NOTE: This is an edge case test. pyenv-installed Python may use"
+echo "      static OpenSSL linking, which prevents SSL capture."
+echo ""
+
+# Create output dir
+mkdir -p /output
+
+# Show Python info
+echo "Python Version: $(python --version)"
+echo "Python Path: $(which python)"
+echo ""
+
+# Check sensor
+echo "Sensor version:"
+oisp-sensor --version
+echo ""
+
+# Run system check
+echo "System check:"
+oisp-sensor check || true
+echo ""
+
+# Start sensor (sslsniff is embedded and auto-extracted)
+echo "Starting sensor..."
+oisp-sensor record \
+    --output /output/events.jsonl \
+    > /output/sensor.log 2>&1 &
+SENSOR_PID=$!
+
+# Wait for sensor to initialize
+sleep 5
+
+if ! kill -0 $SENSOR_PID 2>/dev/null; then
+    echo "ERROR: Sensor failed to start"
+    cat /output/sensor.log
+    exit 1
+fi
+
+echo "Sensor running (PID: $SENSOR_PID)"
+echo ""
+
+# Make pyenv Python OpenAI API call
+echo "Making pyenv Python OpenAI API call..."
+python app.py
+echo ""
+
+# Wait for events
+echo "Waiting for events..."
+sleep 5
+
+# Stop sensor
+echo "Stopping sensor..."
+kill -TERM $SENSOR_PID 2>/dev/null || true
+sleep 2
+
+# Show sensor log
+echo ""
+echo "=== Sensor Log ==="
+cat /output/sensor.log || echo "(no log)"
+echo "=== End Sensor Log ==="
+echo ""
+
+# Show captured events
+echo "Captured events:"
+if [ -f /output/events.jsonl ] && [ -s /output/events.jsonl ]; then
+    cat /output/events.jsonl
+    EVENT_COUNT=$(wc -l < /output/events.jsonl)
+    echo ""
+    echo "Total events: $EVENT_COUNT"
+
+    # Validate
+    echo ""
+    echo "Validating..."
+    python /scripts/validate.py /output/events.jsonl expected-events.json
+    RESULT=$?
+
+    echo ""
+    if [ $RESULT -eq 0 ]; then
+        echo "=== TEST PASSED ==="
+        echo "pyenv Python SSL capture WORKING (unexpected but good!)"
+    else
+        echo "=== TEST FAILED (validation) ==="
+    fi
+
+    exit $RESULT
+else
+    echo "(no events captured)"
+    echo ""
+    echo "=== EDGE CASE CONFIRMED ==="
+    echo "No events captured with pyenv Python (static OpenSSL linking)."
+    echo "This is EXPECTED behavior for this edge case."
+    echo ""
+    # Exit 0 because this is the expected outcome for this edge case
+    exit 0
+fi
+EOF
+
+RUN chmod +x /app/run-test.sh
+
+CMD ["/app/run-test.sh"]

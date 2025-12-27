@@ -1,7 +1,9 @@
 # PR Validation
 #
-# Fast validation for pull requests - only tests changed cookbooks
-# If shared infrastructure changes, tests all cookbooks
+# Fast validation for pull requests - only tests changed cookbooks.
+# If shared infrastructure changes, tests all cookbooks.
+#
+# Uses Docker-based testing with self-contained Dockerfile.test for each cookbook.
 
 name: PR Validation
 
@@ -28,27 +30,6 @@ env:
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
 jobs:
-  # Download sensor once, share with all jobs
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      sensor-version: ${{ steps.download.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download OISP Sensor
-        id: download
-        run: |
-          ./shared/scripts/download-sensor.sh latest
-          echo "version=$(./bin/oisp-sensor --version | head -1)" >> $GITHUB_OUTPUT
-
-      - name: Upload sensor binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: oisp-sensor
-          path: bin/oisp-sensor
-          retention-days: 1
-
   # Detect which cookbooks changed
   detect-changes:
     runs-on: ubuntu-latest
@@ -72,34 +53,42 @@ jobs:
           echo "$changed"
           echo ""
 
-          # If shared/ or .github/workflows/ changed, test all cookbooks
+          # If shared/ or .github/workflows/ changed, test all cookbooks with Dockerfile.test
           if echo "$changed" | grep -qE '^(shared/|\.github/workflows/)'; then
             echo "Shared infrastructure changed - testing all cookbooks"
             echo "test-all=true" >> $GITHUB_OUTPUT
-            cookbooks=$(./shared/scripts/discover-cookbooks.sh | \
-              jq -R -s 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})')
+            # Find all cookbooks with Dockerfile.test (excludes kubernetes)
+            cookbooks=$(find . -name "Dockerfile.test" -not -path "./kubernetes/*" \
+              -exec dirname {} \; | sed 's|^\./||' | sort | \
+              jq -R -s -c 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})')
             echo "cookbooks=$cookbooks" >> $GITHUB_OUTPUT
             echo "count=$(echo "$cookbooks" | jq 'length')" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Find affected cookbooks (any file in cookbook directory changed)
-          cookbooks=$(echo "$changed" | \
-            grep -E '^(python|node|edge-cases|multi-process|self-hosted|kubernetes)/' | \
+          # Find affected cookbooks that have Dockerfile.test
+          affected_dirs=$(echo "$changed" | \
+            grep -E '^(python|node|edge-cases|multi-process|self-hosted)/' | \
             cut -d/ -f1-2 | \
-            sort -u | \
-            jq -R -s 'split("\n")[:-1] | map(select(length > 0)) | map({name: (.|gsub("/";"-")), path: .})')
+            sort -u)
 
-          echo "Affected cookbooks:"
+          cookbooks="[]"
+          for dir in $affected_dirs; do
+            if [ -f "$dir/Dockerfile.test" ]; then
+              cookbooks=$(echo "$cookbooks" | jq --arg d "$dir" '. + [{name: ($d|gsub("/";"-")), path: $d}]')
+            fi
+          done
+
+          echo "Affected cookbooks with Dockerfile.test:"
           echo "$cookbooks" | jq -r '.[].path'
 
           echo "cookbooks=$cookbooks" >> $GITHUB_OUTPUT
           echo "test-all=false" >> $GITHUB_OUTPUT
           echo "count=$(echo "$cookbooks" | jq 'length')" >> $GITHUB_OUTPUT
 
-  # Test changed cookbooks
+  # Test changed cookbooks using Docker
   test-changed:
-    needs: [setup, detect-changes]
+    needs: detect-changes
     if: needs.detect-changes.outputs.count != '0'
     runs-on: ubuntu-latest
     strategy:
@@ -108,41 +97,55 @@ jobs:
         cookbook: ${{ fromJson(needs.detect-changes.outputs.cookbooks) }}
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download sensor binary
-        uses: actions/download-artifact@v4
+      - name: Checkout cookbook repo
+        uses: actions/checkout@v4
         with:
-          name: oisp-sensor
-          path: bin/
+          path: oisp-cookbook
 
-      - name: Make sensor executable
-        run: chmod +x bin/oisp-sensor
-
-      - name: Setup Python
-        if: startsWith(matrix.cookbook.path, 'python/')
-        uses: actions/setup-python@v5
+      - name: Checkout sensor repo
+        uses: actions/checkout@v4
         with:
-          python-version: '3.11'
+          repository: OximyHQ/oisp-sensor
+          ref: main
+          path: oisp-sensor
+          submodules: recursive
 
-      - name: Setup Node.js
-        if: startsWith(matrix.cookbook.path, 'node/')
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Run ${{ matrix.cookbook.name }}
-        env:
-          OISP_SENSOR_BIN: ${{ github.workspace }}/bin/oisp-sensor
+      - name: Build test image
         run: |
-          ./shared/scripts/run-cookbook-test.sh ${{ matrix.cookbook.path }}
+          COOKBOOK="${{ matrix.cookbook.path }}"
+          IMAGE_NAME="oisp-test-$(echo $COOKBOOK | tr '/' '-'):latest"
+
+          echo "Building: $IMAGE_NAME"
+          docker build \
+            -f "oisp-cookbook/$COOKBOOK/Dockerfile.test" \
+            -t "$IMAGE_NAME" \
+            --build-context oisp-sensor=oisp-sensor \
+            --build-context oisp-cookbook=oisp-cookbook \
+            .
+
+      - name: Run test
+        run: |
+          COOKBOOK="${{ matrix.cookbook.path }}"
+          IMAGE_NAME="oisp-test-$(echo $COOKBOOK | tr '/' '-'):latest"
+
+          mkdir -p output
+
+          echo "Running: $COOKBOOK"
+          docker run --rm --privileged \
+            -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+            -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+            -v "$(pwd)/output:/output" \
+            "$IMAGE_NAME"
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ matrix.cookbook.name }}
-          path: ${{ matrix.cookbook.path }}/output/
+          path: output/
           retention-days: 7
 
   # Summary

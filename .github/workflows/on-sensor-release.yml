@@ -2,6 +2,8 @@
 #
 # Triggered by oisp-sensor when a new release is created.
 # Validates that the new release works with ALL cookbooks (strict quality gate).
+#
+# Uses Docker-based testing with self-contained Dockerfile.test for each cookbook.
 
 name: Release Validation
 
@@ -10,10 +12,10 @@ on:
     types: [sensor-release]
   workflow_dispatch:
     inputs:
-      sensor_version:
-        description: 'Sensor version to test'
+      sensor_ref:
+        description: 'oisp-sensor git ref to test (tag, branch, or SHA)'
         required: true
-        default: 'latest'
+        default: 'main'
 
 # Minimal permissions for security
 permissions:
@@ -25,37 +27,24 @@ env:
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
 jobs:
-  # Download and cache sensor version
+  # Get sensor ref from dispatch or input
   setup:
     runs-on: ubuntu-latest
     outputs:
-      sensor-version: ${{ steps.version.outputs.version }}
+      sensor-ref: ${{ steps.ref.outputs.ref }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Get sensor version
-        id: version
+      - name: Get sensor ref
+        id: ref
         run: |
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            VERSION="${{ github.event.client_payload.version }}"
+            REF="${{ github.event.client_payload.ref || github.event.client_payload.version }}"
           else
-            VERSION="${{ github.event.inputs.sensor_version }}"
+            REF="${{ github.event.inputs.sensor_ref }}"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Testing sensor version: $VERSION"
+          echo "ref=$REF" >> $GITHUB_OUTPUT
+          echo "Testing sensor ref: $REF"
 
-      - name: Download sensor
-        run: |
-          ./shared/scripts/download-sensor.sh ${{ steps.version.outputs.version }}
-
-      - name: Upload sensor binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: oisp-sensor
-          path: bin/oisp-sensor
-          retention-days: 1
-
-  # Auto-discover all cookbooks
+  # Auto-discover all cookbooks with Dockerfile.test
   discover:
     runs-on: ubuntu-latest
     outputs:
@@ -63,11 +52,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Discover cookbooks
+      - name: Discover cookbooks with Dockerfile.test
         id: discover
         run: |
-          # Generate JSON array for matrix - test ALL cookbooks on release
-          COOKBOOKS=$(./shared/scripts/discover-cookbooks.sh | \
+          # Find all cookbooks with Dockerfile.test (excludes kubernetes which has its own test)
+          COOKBOOKS=$(find . -name "Dockerfile.test" -not -path "./kubernetes/*" \
+            -exec dirname {} \; | sed 's|^\./||' | sort | \
             jq -R -s -c 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})')
           echo "cookbooks=$COOKBOOKS" >> $GITHUB_OUTPUT
 
@@ -84,41 +74,63 @@ jobs:
         cookbook: ${{ fromJson(needs.discover.outputs.cookbooks) }}
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download sensor binary
-        uses: actions/download-artifact@v4
+      - name: Checkout cookbook repo
+        uses: actions/checkout@v4
         with:
-          name: oisp-sensor
-          path: bin/
+          path: oisp-cookbook
 
-      - name: Make sensor executable
-        run: chmod +x bin/oisp-sensor
-
-      - name: Setup Python
-        if: startsWith(matrix.cookbook.path, 'python/')
-        uses: actions/setup-python@v5
+      - name: Checkout sensor repo
+        uses: actions/checkout@v4
         with:
-          python-version: '3.11'
+          repository: OximyHQ/oisp-sensor
+          ref: ${{ needs.setup.outputs.sensor-ref }}
+          path: oisp-sensor
+          submodules: recursive
 
-      - name: Setup Node.js
-        if: startsWith(matrix.cookbook.path, 'node/')
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Run ${{ matrix.cookbook.name }}
-        env:
-          OISP_SENSOR_BIN: ${{ github.workspace }}/bin/oisp-sensor
+      - name: Get sensor version
+        id: sensor-version
         run: |
-          ./shared/scripts/run-cookbook-test.sh ${{ matrix.cookbook.path }}
+          cd oisp-sensor
+          VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Testing with sensor: $VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        run: |
+          COOKBOOK="${{ matrix.cookbook.path }}"
+          IMAGE_NAME="oisp-test-$(echo $COOKBOOK | tr '/' '-'):latest"
+
+          echo "Building: $IMAGE_NAME"
+          docker build \
+            -f "oisp-cookbook/$COOKBOOK/Dockerfile.test" \
+            -t "$IMAGE_NAME" \
+            --build-context oisp-sensor=oisp-sensor \
+            --build-context oisp-cookbook=oisp-cookbook \
+            .
+
+      - name: Run test
+        run: |
+          COOKBOOK="${{ matrix.cookbook.path }}"
+          IMAGE_NAME="oisp-test-$(echo $COOKBOOK | tr '/' '-'):latest"
+
+          mkdir -p output
+
+          echo "Running: $COOKBOOK"
+          docker run --rm --privileged \
+            -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+            -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+            -v "$(pwd)/output:/output" \
+            "$IMAGE_NAME"
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ matrix.cookbook.name }}
-          path: ${{ matrix.cookbook.path }}/output/
+          path: output/
           retention-days: 7
 
   # Report results back to sensor repo
@@ -130,12 +142,12 @@ jobs:
       - name: Report success
         if: needs.validate.result == 'success'
         run: |
-          echo "✅ All cookbook tests passed for sensor ${{ needs.setup.outputs.sensor-version }}"
+          echo "✅ All cookbook tests passed for sensor ${{ needs.setup.outputs.sensor-ref }}"
           # TODO: Update status check on sensor repo using GitHub API
 
       - name: Report failure
         if: needs.validate.result != 'success'
         run: |
-          echo "❌ Cookbook validation failed for sensor ${{ needs.setup.outputs.sensor-version }}"
+          echo "❌ Cookbook validation failed for sensor ${{ needs.setup.outputs.sensor-ref }}"
           # TODO: Create issue or notify team
           exit 1

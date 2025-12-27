@@ -2,6 +2,9 @@
 #
 # Runs all examples every night to ensure the sensor works with real APIs.
 # This is our source of truth for "does OISP actually work?"
+#
+# Each cookbook has a self-contained Dockerfile.test that builds the sensor
+# from source and runs tests in an isolated environment.
 
 name: Nightly Tests
 
@@ -11,10 +14,10 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
-      sensor_version:
-        description: 'Sensor version to test (default: latest)'
+      sensor_ref:
+        description: 'oisp-sensor git ref to test (branch, tag, or SHA)'
         required: false
-        default: 'latest'
+        default: 'main'
 
 # Minimal permissions for security
 permissions:
@@ -26,29 +29,7 @@ env:
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
 jobs:
-  # Download sensor once, share with all jobs
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      sensor-version: ${{ steps.download.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download OISP Sensor
-        id: download
-        run: |
-          VERSION="${{ github.event.inputs.sensor_version || 'latest' }}"
-          ./shared/scripts/download-sensor.sh $VERSION
-          echo "version=$(./bin/oisp-sensor --version | head -1)" >> $GITHUB_OUTPUT
-
-      - name: Upload sensor binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: oisp-sensor
-          path: bin/oisp-sensor
-          retention-days: 1
-
-  # Auto-discover cookbooks
+  # Auto-discover cookbooks that have Dockerfile.test
   discover:
     runs-on: ubuntu-latest
     outputs:
@@ -56,71 +37,103 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Discover cookbooks
+      - name: Discover cookbooks with Dockerfile.test
         id: discover
         run: |
-          # Generate JSON array for matrix
-          COOKBOOKS=$(./shared/scripts/discover-cookbooks.sh | \
+          # Find all cookbooks with Dockerfile.test (excludes kubernetes which has its own test)
+          COOKBOOKS=$(find . -name "Dockerfile.test" -not -path "./kubernetes/*" \
+            -exec dirname {} \; | sed 's|^\./||' | sort | \
             jq -R -s -c 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})')
           echo "cookbooks=$COOKBOOKS" >> $GITHUB_OUTPUT
 
-          # Show discovered cookbooks
-          echo "Discovered cookbooks:"
+          echo "Discovered cookbooks with Dockerfile.test:"
           echo "$COOKBOOKS" | jq -r '.[].path'
 
-  # Test matrix - each cookbook runs in parallel
+  # Test matrix - each cookbook runs in parallel using Docker
   test-matrix:
-    needs: [setup, discover]
+    needs: discover
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false  # Run all tests, report all failures (strict policy)
+      fail-fast: false  # Run all tests, report all failures
       matrix:
         cookbook: ${{ fromJson(needs.discover.outputs.cookbooks) }}
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download sensor binary
-        uses: actions/download-artifact@v4
+      - name: Checkout cookbook repo
+        uses: actions/checkout@v4
         with:
-          name: oisp-sensor
-          path: bin/
+          path: oisp-cookbook
 
-      - name: Make sensor executable
-        run: chmod +x bin/oisp-sensor
-
-      - name: Setup Python
-        if: startsWith(matrix.cookbook.path, 'python/')
-        uses: actions/setup-python@v5
+      - name: Checkout sensor repo
+        uses: actions/checkout@v4
         with:
-          python-version: '3.11'
+          repository: OximyHQ/oisp-sensor
+          ref: ${{ github.event.inputs.sensor_ref || 'main' }}
+          path: oisp-sensor
+          submodules: recursive
 
-      - name: Setup Node.js
-        if: startsWith(matrix.cookbook.path, 'node/')
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Run ${{ matrix.cookbook.name }}
-        env:
-          OISP_SENSOR_BIN: ${{ github.workspace }}/bin/oisp-sensor
+      - name: Get sensor version
+        id: sensor-version
         run: |
-          ./shared/scripts/run-cookbook-test.sh ${{ matrix.cookbook.path }}
+          cd oisp-sensor
+          VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Testing with sensor: $VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        run: |
+          COOKBOOK="${{ matrix.cookbook.path }}"
+          IMAGE_NAME="oisp-test-$(echo $COOKBOOK | tr '/' '-'):latest"
+
+          echo "Building: $IMAGE_NAME"
+          docker build \
+            -f "oisp-cookbook/$COOKBOOK/Dockerfile.test" \
+            -t "$IMAGE_NAME" \
+            --build-context oisp-sensor=oisp-sensor \
+            --build-context oisp-cookbook=oisp-cookbook \
+            .
+
+      - name: Run test
+        run: |
+          COOKBOOK="${{ matrix.cookbook.path }}"
+          IMAGE_NAME="oisp-test-$(echo $COOKBOOK | tr '/' '-'):latest"
+
+          mkdir -p output
+
+          echo "Running: $COOKBOOK"
+          docker run --rm --privileged \
+            -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+            -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+            -v "$(pwd)/output:/output" \
+            "$IMAGE_NAME"
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ matrix.cookbook.name }}
-          path: ${{ matrix.cookbook.path }}/output/
+          path: output/
           retention-days: 7
 
   # Kubernetes tests (separate job - requires k3d)
   test-kubernetes:
-    needs: setup
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout cookbook repo
+        uses: actions/checkout@v4
+        with:
+          path: oisp-cookbook
+
+      - name: Checkout sensor repo
+        uses: actions/checkout@v4
+        with:
+          repository: OximyHQ/oisp-sensor
+          ref: ${{ github.event.inputs.sensor_ref || 'main' }}
+          path: oisp-sensor
+          submodules: recursive
 
       - name: Setup Python (for validation)
         uses: actions/setup-python@v5
@@ -135,7 +148,7 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          cd kubernetes/daemonset
+          cd oisp-cookbook/kubernetes/daemonset
           chmod +x test.sh
           ./test.sh
 
@@ -144,12 +157,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-kubernetes-daemonset
-          path: kubernetes/daemonset/output/
+          path: oisp-cookbook/kubernetes/daemonset/output/
           retention-days: 7
 
   # Summary report
   report:
-    needs: [setup, test-matrix, test-kubernetes]
+    needs: [discover, test-matrix, test-kubernetes]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -157,7 +170,7 @@ jobs:
         run: |
           echo "## Nightly Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Sensor Version:** ${{ needs.setup.outputs.sensor-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Sensor Ref:** ${{ github.event.inputs.sensor_ref || 'main' }}" >> $GITHUB_STEP_SUMMARY
           echo "**Run Time:** $(date -u)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "See individual job results above for details." >> $GITHUB_STEP_SUMMARY

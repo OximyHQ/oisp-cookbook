@@ -69,11 +69,14 @@ COPY --from=libbpf-builder /usr/local/bin/sslsniff /usr/local/bin/sslsniff
 WORKDIR /build
 COPY oisp-sensor/ ./
 
+# Create dummy frontend for oisp-web (it requires frontend/out to exist)
+RUN mkdir -p frontend/out && echo '<!DOCTYPE html><html><body>Stub</body></html>' > frontend/out/index.html
+
 # Build oisp-sensor with cache mounts and lld linker
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     RUSTFLAGS="-C link-arg=-fuse-ld=lld" \
-    cargo build --release -p oisp-sensor && \
+    cargo build --release -p oisp-sensor --no-default-features --features tui && \
     cp target/release/oisp-sensor /usr/local/bin/oisp-sensor
 
 # Verify sslsniff was embedded

@@ -83,6 +83,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Add kind for kubernetes tests
+      - name: Set up kind (for Kubernetes tests)
+        if: startsWith(matrix.cookbook.path, 'kubernetes/')
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: oisp-test
+
       - name: Build test image
         run: |
           COOKBOOK="${{ matrix.cookbook.path }}"
@@ -104,11 +111,25 @@ jobs:
           mkdir -p output
 
           echo "Running: $COOKBOOK"
-          docker run --rm --privileged \
-            -e OPENAI_API_KEY="$OPENAI_API_KEY" \
-            -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-            -v "$(pwd)/output:/output" \
-            "$IMAGE_NAME"
+          
+          # Kubernetes tests: use host network and docker socket (kind is already running)
+          if [[ "$COOKBOOK" == kubernetes/* ]]; then
+            docker run --rm \
+              --network host \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.kube:/root/.kube:ro" \
+              -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+              -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+              -v "$(pwd)/output:/output" \
+              "$IMAGE_NAME"
+          else
+            # Regular tests: run isolated
+            docker run --rm \
+              -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+              -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+              -v "$(pwd)/output:/output" \
+              "$IMAGE_NAME"
+          fi
 
       - name: Upload logs on failure
         if: failure()

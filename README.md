@@ -1,6 +1,6 @@
 # OISP Cookbook
 
-> Working examples and validation tests for [OISP Sensor](https://github.com/oximyHQ/oisp-sensor)
+> Working examples and validation tests for [OISP Sensor](https://github.com/oximyhq/sensor)
 
 [![Nightly Tests](https://github.com/oximyHQ/oisp-cookbook/actions/workflows/nightly.yml/badge.svg)](https://github.com/oximyHQ/oisp-cookbook/actions/workflows/nightly.yml)
 [![Release Validation](https://github.com/oximyHQ/oisp-cookbook/actions/workflows/on-sensor-release.yml/badge.svg)](https://github.com/oximyHQ/oisp-cookbook/actions/workflows/on-sensor-release.yml)

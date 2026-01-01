@@ -6,7 +6,7 @@
 services:
   # OISP Sensor - captures AI API calls
   sensor:
-    image: ghcr.io/oximyhq/oisp-sensor:latest
+    image: ghcr.io/oximyhq/sensor:latest
     privileged: true  # Required for eBPF
     pid: "host"       # Required to see app processes
     volumes:

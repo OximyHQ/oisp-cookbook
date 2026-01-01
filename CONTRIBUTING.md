@@ -1,6 +1,6 @@
 # Contributing to OISP Cookbook
 
-Thank you for your interest in contributing to the OISP Cookbook! This repository contains working examples that validate [OISP Sensor](https://github.com/oximyHQ/oisp-sensor) functionality.
+Thank you for your interest in contributing to the OISP Cookbook! This repository contains working examples that validate [OISP Sensor](https://github.com/oximyhq/sensor) functionality.
 
 ## Getting Started
 

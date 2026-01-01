@@ -25,7 +25,7 @@ spec:
 
       containers:
         - name: sensor
-          image: ghcr.io/oximyhq/oisp-sensor:latest
+          image: ghcr.io/oximyhq/sensor:latest
           imagePullPolicy: Always
 
           # Sensor command

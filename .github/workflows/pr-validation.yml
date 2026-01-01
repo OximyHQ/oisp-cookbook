@@ -105,7 +105,7 @@ jobs:
       - name: Checkout sensor repo
         uses: actions/checkout@v4
         with:
-          repository: OximyHQ/oisp-sensor
+          repository: oximyhq/sensor
           ref: main
           path: oisp-sensor
           submodules: recursive

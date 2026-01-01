@@ -191,7 +191,7 @@ echo ""
 
 # Patch daemonset to use local image
 echo "Generating DaemonSet manifest with local image..."
-sed 's|ghcr.io/oximyhq/oisp-sensor:latest|oisp-sensor:test-local|g; s/imagePullPolicy: Always/imagePullPolicy: Never/g' \
+sed 's|ghcr.io/oximyhq/sensor:latest|oisp-sensor:test-local|g; s/imagePullPolicy: Always/imagePullPolicy: Never/g' \
     manifests/daemonset.yaml > /tmp/daemonset-local.yaml
 
 # Deploy manifests

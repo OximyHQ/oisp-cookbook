@@ -10,7 +10,7 @@
 set -e
 
 VERSION="${1:-latest}"
-REPO="oximyHQ/oisp-sensor"
+REPO="oximyhq/sensor"
 BIN_DIR="${BIN_DIR:-./bin}"
 
 # Detect architecture

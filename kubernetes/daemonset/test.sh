@@ -105,7 +105,7 @@ k3d image import "$IMAGE_NAME" -c "$CLUSTER_NAME"
 # Create a temporary daemonset.yaml with our local image
 log "Generating DaemonSet manifest with local image..."
 TEMP_DAEMONSET=$(mktemp)
-sed "s|ghcr.io/oximyhq/oisp-sensor:latest|$IMAGE_NAME|g" manifests/daemonset.yaml > "$TEMP_DAEMONSET"
+sed "s|ghcr.io/oximyhq/sensor:latest|$IMAGE_NAME|g" manifests/daemonset.yaml > "$TEMP_DAEMONSET"
 # Also change imagePullPolicy to Never since we imported locally
 sed -i.bak 's/imagePullPolicy: Always/imagePullPolicy: Never/g' "$TEMP_DAEMONSET" && rm -f "$TEMP_DAEMONSET.bak"
 

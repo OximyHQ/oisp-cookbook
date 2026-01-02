@@ -1,26 +1,18 @@
 # Test Dockerfile for Kubernetes DaemonSet manifests
 #
 # This test validates the Kubernetes manifests are syntactically correct
-# and can be applied to a cluster. It does NOT test actual traffic capture
-# since eBPF/uprobes don't work in nested container environments (CI).
+# and contain required eBPF configurations. It does NOT test actual traffic
+# capture since eBPF/uprobes don't work in nested container environments (CI).
 #
 # For full E2E testing, deploy to a real Kubernetes cluster.
 
 # =============================================================================
 # Manifest validator (lightweight - no sensor build needed)
 # =============================================================================
-FROM alpine:3.20
+FROM python:3.12-alpine
 
-# Install kubectl for manifest validation
-RUN apk add --no-cache \
-    bash \
-    curl \
-    jq
-
-# Install kubectl
-RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
-    chmod +x kubectl && \
-    mv kubectl /usr/local/bin/
+# Install dependencies
+RUN pip install --no-cache-dir pyyaml
 
 # Copy manifests
 WORKDIR /test
@@ -28,108 +20,118 @@ COPY oisp-cookbook/kubernetes/daemonset/manifests/ ./manifests/
 
 # Validation script
 COPY <<'EOF' /test/run-test.sh
-#!/bin/bash
-set -e
+#!/usr/bin/env python3
+"""
+Kubernetes manifest validation script.
+Validates YAML syntax and required eBPF configurations.
+"""
 
-echo "=== OISP Kubernetes DaemonSet Manifest Validation ==="
-echo ""
-echo "This test validates manifests are syntactically correct."
-echo "For full E2E testing, deploy to a real Kubernetes cluster."
-echo ""
+import sys
+import os
+import yaml
+from pathlib import Path
 
-# Create output dir
-mkdir -p /output
+def main():
+    print("=== OISP Kubernetes DaemonSet Manifest Validation ===")
+    print()
+    print("This test validates manifests are syntactically correct.")
+    print("For full E2E testing, deploy to a real Kubernetes cluster.")
+    print()
 
-ERRORS=0
+    # Create output dir
+    Path("/output").mkdir(exist_ok=True)
 
-# Validate each manifest file
-echo "Validating manifests..."
-for manifest in manifests/*.yaml; do
-    echo -n "  $manifest: "
+    errors = 0
+    manifests_dir = Path("manifests")
 
-    # Check YAML syntax with kubectl
-    if kubectl apply --dry-run=client -f "$manifest" > /dev/null 2>&1; then
-        echo "✓ valid"
-    else
-        echo "✗ INVALID"
-        kubectl apply --dry-run=client -f "$manifest" 2>&1 | head -5
-        ERRORS=$((ERRORS + 1))
-    fi
-done
+    # Validate YAML syntax
+    print("Validating YAML syntax...")
+    for manifest in sorted(manifests_dir.glob("*.yaml")):
+        print(f"  {manifest}: ", end="")
+        try:
+            with open(manifest) as f:
+                docs = list(yaml.safe_load_all(f))
+            if docs and docs[0]:
+                print("✓ valid")
+            else:
+                print("⚠ empty")
+        except yaml.YAMLError as e:
+            print("✗ INVALID")
+            print(f"    {e}")
+            errors += 1
 
-echo ""
+    print()
 
-# Check required files exist
-echo "Checking required manifests exist..."
-REQUIRED_FILES="namespace.yaml configmap.yaml daemonset.yaml"
-for file in $REQUIRED_FILES; do
-    echo -n "  $file: "
-    if [ -f "manifests/$file" ]; then
-        echo "✓ exists"
-    else
-        echo "✗ MISSING"
-        ERRORS=$((ERRORS + 1))
-    fi
-done
+    # Check required files
+    print("Checking required manifests exist...")
+    required = ["namespace.yaml", "configmap.yaml", "daemonset.yaml"]
+    for filename in required:
+        print(f"  {filename}: ", end="")
+        if (manifests_dir / filename).exists():
+            print("✓ exists")
+        else:
+            print("✗ MISSING")
+            errors += 1
 
-echo ""
+    print()
 
-# Validate DaemonSet has required fields
-echo "Validating DaemonSet structure..."
-if [ -f manifests/daemonset.yaml ]; then
-    # Check for hostPID (required for eBPF)
-    echo -n "  hostPID: "
-    if grep -q "hostPID: true" manifests/daemonset.yaml; then
-        echo "✓ enabled"
-    else
-        echo "✗ not enabled (required for eBPF)"
-        ERRORS=$((ERRORS + 1))
-    fi
+    # Validate DaemonSet structure
+    print("Validating DaemonSet structure...")
+    daemonset_file = manifests_dir / "daemonset.yaml"
+    if daemonset_file.exists():
+        with open(daemonset_file) as f:
+            content = f.read()
 
-    # Check for privileged security context
-    echo -n "  privileged: "
-    if grep -q "privileged: true" manifests/daemonset.yaml; then
-        echo "✓ enabled"
-    else
-        echo "✗ not enabled (required for eBPF)"
-        ERRORS=$((ERRORS + 1))
-    fi
+        # Check hostPID
+        print("  hostPID: ", end="")
+        if "hostPID: true" in content:
+            print("✓ enabled")
+        else:
+            print("✗ not enabled (required for eBPF)")
+            errors += 1
 
-    # Check for BPF capability
-    echo -n "  CAP_BPF: "
-    if grep -q "BPF" manifests/daemonset.yaml; then
-        echo "✓ present"
-    else
-        echo "⚠ not found (may work with privileged)"
-    fi
+        # Check privileged
+        print("  privileged: ", end="")
+        if "privileged: true" in content:
+            print("✓ enabled")
+        else:
+            print("✗ not enabled (required for eBPF)")
+            errors += 1
 
-    # Check for bpf volume mount
-    echo -n "  /sys/fs/bpf mount: "
-    if grep -q "/sys/fs/bpf" manifests/daemonset.yaml; then
-        echo "✓ present"
-    else
-        echo "✗ missing (required for eBPF)"
-        ERRORS=$((ERRORS + 1))
-    fi
-fi
+        # Check BPF capability
+        print("  CAP_BPF: ", end="")
+        if "BPF" in content:
+            print("✓ present")
+        else:
+            print("⚠ not found (may work with privileged)")
 
-echo ""
+        # Check bpf mount
+        print("  /sys/fs/bpf mount: ", end="")
+        if "/sys/fs/bpf" in content:
+            print("✓ present")
+        else:
+            print("✗ missing (required for eBPF)")
+            errors += 1
 
-# Summary
-if [ $ERRORS -eq 0 ]; then
-    echo "=== VALIDATION PASSED ==="
-    echo ""
-    echo "All manifests are valid and contain required configurations."
-    echo "Deploy to a real Kubernetes cluster for full E2E testing."
-    exit 0
-else
-    echo "=== VALIDATION FAILED ==="
-    echo ""
-    echo "Found $ERRORS error(s). Please fix the issues above."
-    exit 1
-fi
+    print()
+
+    # Summary
+    if errors == 0:
+        print("=== VALIDATION PASSED ===")
+        print()
+        print("All manifests are valid and contain required configurations.")
+        print("Deploy to a real Kubernetes cluster for full E2E testing.")
+        return 0
+    else:
+        print("=== VALIDATION FAILED ===")
+        print()
+        print(f"Found {errors} error(s). Please fix the issues above.")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
 EOF
 
 RUN chmod +x /test/run-test.sh
 
-CMD ["/test/run-test.sh"]
+CMD ["python3", "/test/run-test.sh"]

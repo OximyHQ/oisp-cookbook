@@ -1,0 +1,106 @@
+# Test Application for validating OISP Sensor captures
+#
+# This Job deploys a Python container that makes OpenAI API calls.
+# The sensor should capture these calls and produce ai.request/ai.response events.
+#
+# Prerequisites:
+# 1. Sensor DaemonSet must be running
+# 2. Create secret with API key:
+#    oc create secret generic openai-api-key \
+#      -n oisp-sensor \
+#      --from-literal=OPENAI_API_KEY="sk-..."
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-app
+  namespace: oisp-sensor
+  labels:
+    app.kubernetes.io/name: test-app
+    app.kubernetes.io/component: testing
+spec:
+  # Retry up to 2 times on failure
+  backoffLimit: 2
+  # Clean up after 5 minutes
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: test-app
+    spec:
+      restartPolicy: Never
+
+      containers:
+        - name: app
+          # Using official Python image
+          image: python:3.11-slim
+
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "Installing OpenAI SDK..."
+              pip install -q openai
+
+              echo "Running test application..."
+              python3 << 'EOF'
+              import os
+              import sys
+              from openai import OpenAI
+
+              # Initialize client
+              api_key = os.environ.get("OPENAI_API_KEY")
+              if not api_key:
+                  print("ERROR: OPENAI_API_KEY not set")
+                  sys.exit(1)
+
+              client = OpenAI(api_key=api_key)
+
+              print("Making OpenAI API call...")
+              print("=" * 50)
+
+              try:
+                  response = client.chat.completions.create(
+                      model="gpt-4o-mini",
+                      messages=[
+                          {
+                              "role": "system",
+                              "content": "You are a helpful assistant. Be concise."
+                          },
+                          {
+                              "role": "user",
+                              "content": "Say hello in exactly 3 words."
+                          }
+                      ],
+                      max_tokens=50
+                  )
+
+                  # Print response details
+                  print(f"Model: {response.model}")
+                  print(f"Response: {response.choices[0].message.content}")
+                  print(f"Finish reason: {response.choices[0].finish_reason}")
+                  print(f"Prompt tokens: {response.usage.prompt_tokens}")
+                  print(f"Completion tokens: {response.usage.completion_tokens}")
+                  print(f"Total tokens: {response.usage.total_tokens}")
+                  print("=" * 50)
+                  print("SUCCESS: OpenAI API call completed!")
+
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  sys.exit(1)
+              EOF
+
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-api-key
+                  key: OPENAI_API_KEY
+
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"

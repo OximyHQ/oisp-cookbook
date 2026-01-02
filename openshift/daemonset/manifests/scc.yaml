@@ -1,0 +1,84 @@
+# Security Context Constraint for OISP Sensor
+#
+# This SCC grants the privileges required for eBPF-based SSL/TLS interception.
+# It must be applied by a cluster-admin before deploying the sensor.
+#
+# Required permissions:
+# - privileged: eBPF programs require elevated privileges
+# - hostPID: Sensor needs to see processes on the host
+# - hostNetwork: Sensor captures network traffic at host level
+# - SYS_ADMIN/BPF: Required for loading eBPF programs
+# - SYS_PTRACE: Required for attaching uprobes to processes
+# - NET_ADMIN: Required for network packet inspection
+# - PERFMON: Required for performance monitoring (eBPF perf events)
+
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: oisp-sensor-scc
+  labels:
+    app.kubernetes.io/name: oisp-sensor
+    app.kubernetes.io/component: security
+  annotations:
+    kubernetes.io/description: |
+      SCC for OISP Sensor DaemonSet. Grants privileged access required for
+      eBPF-based AI API call monitoring. Only bind to the oisp-sensor
+      ServiceAccount in the oisp-sensor namespace.
+
+# Allow privileged containers for eBPF
+allowPrivilegedContainer: true
+allowPrivilegeEscalation: true
+
+# Host namespace access
+allowHostPID: true
+allowHostNetwork: true
+allowHostPorts: true
+allowHostIPC: false
+
+# Volume types
+allowHostDirVolumePlugin: true
+volumes:
+  - hostPath
+  - configMap
+  - emptyDir
+  - secret
+  - projected
+  - downwardAPI
+
+# Capabilities for eBPF
+allowedCapabilities:
+  - SYS_ADMIN
+  - SYS_PTRACE
+  - NET_ADMIN
+  - BPF
+  - PERFMON
+
+# Required capabilities (always added)
+requiredDropCapabilities: []
+defaultAddCapabilities: []
+
+# User/group settings
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+
+# Read-only root filesystem
+readOnlyRootFilesystem: false
+
+# Seccomp profile
+seccompProfiles:
+  - '*'
+
+# Users/groups that can use this SCC
+# The sensor ServiceAccount is bound via RBAC, but we also list it here explicitly
+users:
+  - system:serviceaccount:oisp-sensor:oisp-sensor
+groups: []
+
+# Priority (higher = preferred when multiple SCCs match)
+priority: 10

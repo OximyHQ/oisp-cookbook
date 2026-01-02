@@ -1,0 +1,55 @@
+# ConfigMap for OISP Sensor configuration
+#
+# This configures how the sensor captures and exports AI events.
+# Modify these settings based on your requirements.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oisp-sensor-config
+  namespace: oisp-sensor
+  labels:
+    app.kubernetes.io/name: oisp-sensor
+    app.kubernetes.io/component: configuration
+data:
+  config.yaml: |
+    # OISP Sensor Configuration for OpenShift
+
+    # Output configuration
+    output:
+      # Write events to JSONL file
+      format: jsonl
+      path: /output/events.jsonl
+      # Rotate log files when they reach this size
+      max_size_mb: 100
+      # Keep this many rotated files
+      max_files: 5
+
+    # Capture filters
+    filters:
+      # Only capture AI-related events (reduces noise)
+      ai_only: true
+      # Capture from all processes (no PID filter)
+      # pid_filter: []
+
+    # Redaction settings
+    redaction:
+      # Enable redaction of sensitive data
+      enabled: true
+      # Redaction mode: safe (default), minimal, full
+      mode: safe
+      # Redact API keys in captured data
+      redact_api_keys: true
+      # Redact email addresses
+      redact_emails: true
+
+    # Provider detection
+    providers:
+      # Auto-detect AI providers from domain patterns
+      auto_detect: true
+      # Supported providers (auto-detected):
+      # - OpenAI (api.openai.com)
+      # - Anthropic (api.anthropic.com)
+      # - Azure OpenAI (*.openai.azure.com)
+      # - Google AI (generativelanguage.googleapis.com)
+      # - And 20+ more...

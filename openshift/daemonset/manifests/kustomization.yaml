@@ -1,0 +1,34 @@
+# Kustomization for OISP Sensor on OpenShift
+#
+# Usage:
+#   oc apply -k manifests/
+#
+# This applies all resources in the correct order.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: oisp-sensor
+
+# Resources in dependency order
+resources:
+  # 1. Create namespace first
+  - namespace.yaml
+  # 2. Security Context Constraint (requires cluster-admin)
+  - scc.yaml
+  # 3. ServiceAccount and RBAC
+  - service-account.yaml
+  # 4. Configuration
+  - configmap.yaml
+  # 5. The DaemonSet itself
+  - daemonset.yaml
+  # Note: test-app.yaml is NOT included here - it's for testing only
+
+# Common labels applied to all resources
+commonLabels:
+  app.kubernetes.io/part-of: oisp
+  app.kubernetes.io/managed-by: kustomize
+
+# Annotations
+commonAnnotations:
+  app.kubernetes.io/version: "0.1.0"

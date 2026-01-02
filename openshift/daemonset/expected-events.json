@@ -1,0 +1,22 @@
+{
+  "$schema": "https://oisp.dev/cookbook/expected-events.schema.json",
+  "description": "OpenShift DaemonSet capturing AI API calls from test app",
+  "minimum_events": 2,
+  "events": [
+    {
+      "event_type": "ai.request",
+      "required_fields": {
+        "data.provider.name": "openai",
+        "data.model.id": "/gpt-4o.*/",
+        "data.request_type": "chat"
+      }
+    },
+    {
+      "event_type": "ai.response",
+      "required_fields": {
+        "data.success": true,
+        "data.usage.total_tokens": "> 0"
+      }
+    }
+  ]
+}

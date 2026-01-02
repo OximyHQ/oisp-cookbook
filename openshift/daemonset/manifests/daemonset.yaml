@@ -1,0 +1,186 @@
+# OISP Sensor DaemonSet for OpenShift
+#
+# This deploys the sensor on every node in the cluster.
+# The sensor uses eBPF to capture SSL/TLS traffic and detect AI API calls.
+#
+# Prerequisites:
+# 1. Apply scc.yaml (requires cluster-admin)
+# 2. Apply namespace.yaml
+# 3. Apply service-account.yaml
+# 4. Apply configmap.yaml
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: oisp-sensor
+  namespace: oisp-sensor
+  labels:
+    app.kubernetes.io/name: oisp-sensor
+    app.kubernetes.io/component: observability
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oisp-sensor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oisp-sensor
+      annotations:
+        # OpenShift: Explicitly request the SCC
+        openshift.io/scc: oisp-sensor-scc
+    spec:
+      # ServiceAccount with SCC binding
+      serviceAccountName: oisp-sensor
+
+      # Run on all nodes including control plane
+      tolerations:
+        - operator: Exists
+
+      # Use host namespaces for eBPF visibility
+      hostPID: true
+      hostNetwork: true
+
+      # Don't wait for DNS (we use host network)
+      dnsPolicy: ClusterFirstWithHostNet
+
+      containers:
+        - name: sensor
+          image: ghcr.io/oximyhq/sensor:latest
+          imagePullPolicy: Always
+
+          # Sensor command
+          args:
+            - record
+            - --output
+            - /output/events.jsonl
+
+          # Security context for eBPF
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - SYS_PTRACE
+                - NET_ADMIN
+                - BPF
+                - PERFMON
+
+          # Resource limits
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+          # Volume mounts
+          volumeMounts:
+            # Output directory (persistent)
+            - name: output
+              mountPath: /output
+
+            # eBPF filesystem (required)
+            - name: bpf
+              mountPath: /sys/fs/bpf
+
+            # Debug filesystem (required for kprobes)
+            - name: debug
+              mountPath: /sys/kernel/debug
+              readOnly: true
+
+            # Configuration
+            - name: config
+              mountPath: /etc/oisp-sensor
+              readOnly: true
+
+            # Host libraries for SSL interception
+            - name: lib
+              mountPath: /host/lib
+              readOnly: true
+
+            - name: lib64
+              mountPath: /host/lib64
+              readOnly: true
+
+            - name: usr-lib
+              mountPath: /host/usr/lib
+              readOnly: true
+
+          # Environment variables
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          # Readiness probe - check if sensor process is running
+          readinessProbe:
+            exec:
+              command:
+                - pgrep
+                - -f
+                - oisp-sensor
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Liveness probe - check process is still alive
+          livenessProbe:
+            exec:
+              command:
+                - pgrep
+                - -f
+                - oisp-sensor
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        # Output directory - using hostPath for simplicity
+        # In production, use a PersistentVolume or ship to remote storage
+        - name: output
+          hostPath:
+            path: /var/log/oisp-sensor
+            type: DirectoryOrCreate
+
+        # eBPF filesystem
+        - name: bpf
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+
+        # Debug filesystem
+        - name: debug
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+
+        # Configuration from ConfigMap
+        - name: config
+          configMap:
+            name: oisp-sensor-config
+
+        # Host libraries for SSL/TLS interception
+        - name: lib
+          hostPath:
+            path: /lib
+            type: Directory
+
+        - name: lib64
+          hostPath:
+            path: /lib64
+            type: DirectoryOrCreate
+
+        - name: usr-lib
+          hostPath:
+            path: /usr/lib
+            type: Directory

@@ -1,4 +1,8 @@
-# OISP Cookbook
+<p align="center">
+  <a href="https://sensor.oximy.com/cookbooks/overview">
+    <img src="https://raw.githubusercontent.com/oximyhq/oisp-cookbook/main/assets/banner.png" alt="OISP Cookbook" width="100%">
+  </a>
+</p>
 
 > Working examples and validation tests for [OISP Sensor](https://github.com/oximyhq/sensor)
 

@@ -1,9 +1,11 @@
 # Test Dockerfile for OpenShift DaemonSet deployment
 #
-# This test builds the sensor, creates a MicroShift environment inside Docker,
-# deploys the DaemonSet with SCC, runs a test app, and validates captured events.
+# This test builds the sensor, and runs the OpenShift deployment test.
+# Uses k3d for testing (MicroShift is too heavy for CI).
 #
-# Uses Docker-in-Docker (DinD) to run MicroShift inside the container.
+# Two modes:
+# 1. CI mode: k3d runs on host, this container mounts docker socket & kubeconfig
+# 2. Local mode: Can run with DinD for local testing
 #
 # Prerequisites:
 #   Clone with submodules: git clone --recurse-submodules <repo>
@@ -69,7 +71,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/oisp-sensor /usr/local/bin/oisp-sensor
 
 # =============================================================================
-# Stage 3: Build sensor Docker image (for import into MicroShift)
+# Stage 3: Build sensor Docker image (exported as tar for CI to load)
 # =============================================================================
 FROM debian:trixie-slim AS sensor-image
 
@@ -94,32 +96,26 @@ ENTRYPOINT ["oisp-sensor"]
 CMD ["record", "--output", "/output/events.jsonl"]
 
 # =============================================================================
-# Stage 4: Test runner with Docker-in-Docker + MicroShift
+# Stage 4: Test runner - lightweight, uses host's Docker/k3d
 # =============================================================================
-FROM docker:24-dind
+FROM ubuntu:24.04
 
 # Install dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y \
     bash \
     curl \
     jq \
     python3 \
-    py3-pip \
-    git \
-    coreutils \
-    sed
+    docker.io \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install kubectl (works with OpenShift API)
+# Install kubectl
 RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
     chmod +x kubectl && \
     mv kubectl /usr/local/bin/
 
-# Install oc CLI (OpenShift client) for SCC support
-# Note: Using kubectl as fallback since oc requires glibc
-# MicroShift accepts standard k8s API calls for most resources
-RUN curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
-    | tar -xz -C /usr/local/bin oc 2>/dev/null || \
-    echo "oc CLI not available, using kubectl (SCC will be applied via kubectl)"
+# Install k3d
+RUN curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
 
 # Copy sensor binary for reference
 COPY --from=builder /usr/local/bin/oisp-sensor /usr/local/bin/
@@ -130,7 +126,7 @@ COPY oisp-cookbook/openshift/daemonset/manifests/ ./manifests/
 COPY oisp-cookbook/openshift/daemonset/expected-events.json .
 COPY --chmod=755 oisp-cookbook/shared/scripts/validate.py /scripts/
 
-# Copy sensor rootfs for building image
+# Save sensor image rootfs for building
 COPY --from=sensor-image / /sensor-rootfs/
 
 # Test script
@@ -140,18 +136,17 @@ set -e
 
 echo "=== OISP OpenShift DaemonSet E2E Test ==="
 echo ""
+echo "Note: Running with k3d (OpenShift SCCs are not enforced in k3d,"
+echo "      but manifests and RBAC are validated)"
+echo ""
 
 # Create output dir
 mkdir -p /output
 
 # Check prerequisites
 echo "Checking prerequisites..."
-echo "kubectl version: $(kubectl version --client -o json | jq -r '.clientVersion.gitVersion')"
-if command -v oc &>/dev/null; then
-    echo "oc version: $(oc version --client 2>/dev/null | head -1 || echo 'available')"
-else
-    echo "oc CLI: not available (using kubectl)"
-fi
+echo "kubectl version: $(kubectl version --client -o json 2>/dev/null | jq -r '.clientVersion.gitVersion' 2>/dev/null || echo 'unknown')"
+echo "k3d version: $(k3d version 2>/dev/null | head -1 || echo 'not installed')"
 echo ""
 
 # Check API key
@@ -160,19 +155,18 @@ if [ -z "$OPENAI_API_KEY" ]; then
     exit 1
 fi
 
-# Use oc if available, otherwise kubectl
-OC="kubectl"
-if command -v oc &>/dev/null; then
-    OC="oc"
-fi
-
-# Docker should already be ready (started in entrypoint)
+# Check if docker is available (should be mounted from host)
 echo "Docker status:"
-docker info 2>/dev/null | grep -E "(Server Version|Storage Driver)" || echo "Docker not available"
+if docker info >/dev/null 2>&1; then
+    docker info 2>/dev/null | grep -E "(Server Version|Storage Driver)" || true
+else
+    echo "ERROR: Docker not available. Make sure docker socket is mounted."
+    exit 1
+fi
 echo ""
 
 # Build sensor image from the rootfs we copied
-echo "Building sensor image..."
+echo "Building sensor image for k3d..."
 cat > /tmp/Dockerfile.sensor << 'DOCKERFILE'
 FROM scratch
 COPY . /
@@ -186,191 +180,81 @@ echo "Sensor image built successfully"
 docker images oisp-sensor:test-local
 echo ""
 
-# Start MicroShift container
-# MicroShift provides OpenShift APIs including SCC support
-MICROSHIFT_CONTAINER="oisp-microshift-test-$$"
-MICROSHIFT_IMAGE="quay.io/microshift/microshift-aio:latest"
-
-echo "Pulling MicroShift image..."
-docker pull "$MICROSHIFT_IMAGE" || {
-    echo "WARNING: Could not pull MicroShift image."
-    echo "Falling back to k3s-based test (without SCC validation)..."
-
-    # Fallback: Use k3d like the kubernetes cookbook
-    # This tests the manifests work but doesn't validate SCC specifically
-    curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
-
-    CLUSTER_NAME="oisp-openshift-test-$$"
-    k3d cluster create "$CLUSTER_NAME" --wait
-
-    cleanup() {
-        echo "Cleaning up..."
-        k3d cluster delete "$CLUSTER_NAME" 2>/dev/null || true
-    }
-    trap cleanup EXIT
-
-    k3d image import oisp-sensor:test-local -c "$CLUSTER_NAME"
-
-    # Apply manifests (skip SCC as k3s doesn't support it)
-    kubectl apply -f manifests/namespace.yaml
-    kubectl apply -f manifests/service-account.yaml
-    kubectl apply -f manifests/configmap.yaml
-
-    sed 's|ghcr.io/oximyhq/sensor:latest|oisp-sensor:test-local|g; s/imagePullPolicy: Always/imagePullPolicy: Never/g' \
-        manifests/daemonset.yaml > /tmp/daemonset-local.yaml
-    kubectl apply -f /tmp/daemonset-local.yaml
-
-    # Continue with standard test flow...
-    echo "Waiting for sensor pods (timeout: 120s)..."
-    kubectl wait --for=condition=ready pod -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor --timeout=120s || {
-        echo "ERROR: Sensor pod failed"
-        kubectl get pods -n oisp-sensor -o wide
-        kubectl describe pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor
-        kubectl logs -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor --tail=50 || true
-        exit 1
-    }
-
-    kubectl create secret generic openai-api-key -n oisp-sensor --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY"
-    kubectl apply -f manifests/test-app.yaml
-
-    kubectl wait --for=condition=complete job/test-app -n oisp-sensor --timeout=180s || {
-        echo "ERROR: Test app failed"
-        kubectl logs -n oisp-sensor -l app.kubernetes.io/name=test-app --tail=50 || true
-        exit 1
-    }
-
-    sleep 10
-    SENSOR_POD=$(kubectl get pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor -o jsonpath='{.items[0].metadata.name}')
-    kubectl cp "oisp-sensor/$SENSOR_POD:/output/events.jsonl" /output/events.jsonl 2>/dev/null || touch /output/events.jsonl
-
-    python3 /scripts/validate.py /output/events.jsonl expected-events.json
-    exit $?
-}
-
-echo "Starting MicroShift container: $MICROSHIFT_CONTAINER"
-docker run -d \
-    --name "$MICROSHIFT_CONTAINER" \
-    --privileged \
-    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -p 6443:6443 \
-    "$MICROSHIFT_IMAGE"
+# Create k3d cluster
+CLUSTER_NAME="oisp-openshift-test-$$"
+echo "Creating k3d cluster: $CLUSTER_NAME"
+k3d cluster create "$CLUSTER_NAME" --wait
 
 # Cleanup on exit
 cleanup() {
     echo ""
     echo "Cleaning up..."
-    docker rm -f "$MICROSHIFT_CONTAINER" 2>/dev/null || true
+    k3d cluster delete "$CLUSTER_NAME" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-# Wait for MicroShift to initialize
-echo "Waiting for MicroShift to initialize (this may take 2-3 minutes)..."
-RETRIES=90
-until docker exec "$MICROSHIFT_CONTAINER" test -f /var/lib/microshift/resources/kubeadmin/kubeconfig 2>/dev/null; do
-    RETRIES=$((RETRIES - 1))
-    if [ $RETRIES -eq 0 ]; then
-        echo "ERROR: MicroShift failed to initialize"
-        docker logs "$MICROSHIFT_CONTAINER" --tail=50
-        exit 1
-    fi
-    sleep 2
-    echo -n "."
-done
+# Import sensor image into k3d
+echo "Importing sensor image into k3d..."
+k3d image import oisp-sensor:test-local -c "$CLUSTER_NAME"
 echo ""
 
-# Extract kubeconfig
-echo "Extracting kubeconfig..."
-mkdir -p /root/.kube
-docker cp "$MICROSHIFT_CONTAINER:/var/lib/microshift/resources/kubeadmin/kubeconfig" /root/.kube/config
-
-# Update server address to localhost
-sed -i 's|server:.*|server: https://127.0.0.1:6443|g' /root/.kube/config
-
-# Wait for API server
-echo "Waiting for OpenShift API server..."
-RETRIES=60
-until $OC get nodes &>/dev/null; do
-    RETRIES=$((RETRIES - 1))
-    if [ $RETRIES -eq 0 ]; then
-        echo "ERROR: API server not responding"
-        exit 1
-    fi
-    sleep 2
-    echo -n "."
-done
-echo ""
-echo "OpenShift API server is ready!"
-echo ""
-
-# Import sensor image into MicroShift
-echo "Importing sensor image into MicroShift..."
-docker save oisp-sensor:test-local | docker exec -i "$MICROSHIFT_CONTAINER" ctr -n k8s.io images import -
-echo ""
-
-# Deploy manifests in order
-echo "Deploying namespace..."
-$OC apply -f manifests/namespace.yaml
-
-echo "Deploying SCC (OpenShift-specific)..."
-$OC apply -f manifests/scc.yaml || echo "WARNING: SCC apply failed (may not be supported)"
-
-echo "Deploying ServiceAccount and RBAC..."
-$OC apply -f manifests/service-account.yaml
-
-echo "Deploying ConfigMap..."
-$OC apply -f manifests/configmap.yaml
-
-echo "Deploying sensor DaemonSet..."
+# Patch daemonset to use local image
+echo "Generating DaemonSet manifest with local image..."
 sed 's|ghcr.io/oximyhq/sensor:latest|oisp-sensor:test-local|g; s/imagePullPolicy: Always/imagePullPolicy: Never/g' \
     manifests/daemonset.yaml > /tmp/daemonset-local.yaml
-$OC apply -f /tmp/daemonset-local.yaml
+
+# Deploy manifests (skip SCC as k3d doesn't support it)
+echo "Deploying namespace..."
+kubectl apply -f manifests/namespace.yaml
+
+echo "Deploying ServiceAccount and RBAC..."
+kubectl apply -f manifests/service-account.yaml
+
+echo "Deploying ConfigMap..."
+kubectl apply -f manifests/configmap.yaml
+
+# Note: SCC (scc.yaml) is skipped as k3d doesn't support OpenShift SCCs
+echo "Skipping SCC (OpenShift-specific, not supported in k3d)"
+
+echo "Deploying sensor DaemonSet..."
+kubectl apply -f /tmp/daemonset-local.yaml
 
 # Wait for sensor to be ready
-echo "Waiting for sensor pods (timeout: 180s)..."
-if ! $OC wait --for=condition=ready pod -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor --timeout=180s; then
+echo "Waiting for sensor pods (timeout: 120s)..."
+if ! kubectl wait --for=condition=ready pod -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor --timeout=120s; then
     echo "ERROR: Sensor pod failed to become ready"
     echo "Pod status:"
-    $OC get pods -n oisp-sensor -o wide
+    kubectl get pods -n oisp-sensor -o wide
     echo "Pod description:"
-    $OC describe pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor
+    kubectl describe pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor
     echo "Pod logs:"
-    $OC logs -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor --tail=50 || true
-    echo "SCC status:"
-    $OC get scc oisp-sensor-scc -o yaml 2>/dev/null || echo "(SCC not found)"
+    kubectl logs -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor --tail=50 || true
     exit 1
 fi
 
 echo "Sensor pod is ready!"
 echo ""
 
-# Verify SCC is applied (OpenShift-specific)
-echo "Verifying SCC assignment..."
-$OC get pod -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor \
-    -o jsonpath='{.items[0].metadata.annotations.openshift\.io/scc}' 2>/dev/null || \
-    echo "(SCC annotation not available - may be using k3s fallback)"
-echo ""
-
 # Create API key secret
 echo "Creating API key secret..."
-$OC create secret generic openai-api-key \
+kubectl create secret generic openai-api-key \
     -n oisp-sensor \
-    --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
-    --dry-run=client -o yaml | $OC apply -f -
+    --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY"
 
 # Deploy test application
 echo "Deploying test application..."
-$OC apply -f manifests/test-app.yaml
+kubectl apply -f manifests/test-app.yaml
 
 # Wait for test app to complete
 echo "Waiting for test app to complete (timeout: 180s)..."
-if ! $OC wait --for=condition=complete job/test-app -n oisp-sensor --timeout=180s; then
+if ! kubectl wait --for=condition=complete job/test-app -n oisp-sensor --timeout=180s; then
     echo "ERROR: Test app job failed or timed out"
     echo "Job status:"
-    $OC get jobs -n oisp-sensor
+    kubectl get jobs -n oisp-sensor
     echo "Pod status:"
-    $OC get pods -n oisp-sensor -l app.kubernetes.io/name=test-app
+    kubectl get pods -n oisp-sensor -l app.kubernetes.io/name=test-app
     echo "Test app logs:"
-    $OC logs -n oisp-sensor -l app.kubernetes.io/name=test-app --tail=50 || true
+    kubectl logs -n oisp-sensor -l app.kubernetes.io/name=test-app --tail=50 || true
     exit 1
 fi
 
@@ -383,14 +267,14 @@ sleep 10
 
 # Extract events from sensor pod
 echo "Extracting captured events..."
-SENSOR_POD=$($OC get pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor -o jsonpath='{.items[0].metadata.name}')
+SENSOR_POD=$(kubectl get pods -n oisp-sensor -l app.kubernetes.io/name=oisp-sensor -o jsonpath='{.items[0].metadata.name}')
 
-if ! $OC cp "oisp-sensor/$SENSOR_POD:/output/events.jsonl" /output/events.jsonl 2>/dev/null; then
+if ! kubectl cp "oisp-sensor/$SENSOR_POD:/output/events.jsonl" /output/events.jsonl 2>/dev/null; then
     echo "No events file yet, checking sensor status..."
     echo "Sensor logs:"
-    $OC logs -n oisp-sensor "$SENSOR_POD" --tail=30 || true
+    kubectl logs -n oisp-sensor "$SENSOR_POD" --tail=30 || true
     echo "Output directory contents:"
-    $OC exec -n oisp-sensor "$SENSOR_POD" -- ls -la /output/ 2>/dev/null || true
+    kubectl exec -n oisp-sensor "$SENSOR_POD" -- ls -la /output/ 2>/dev/null || true
     touch /output/events.jsonl
 fi
 
@@ -407,7 +291,7 @@ fi
 # Show sensor logs
 echo ""
 echo "=== Sensor Logs ==="
-$OC logs -n oisp-sensor "$SENSOR_POD" --tail=30 || echo "(no logs)"
+kubectl logs -n oisp-sensor "$SENSOR_POD" --tail=30 || echo "(no logs)"
 echo "=== End Sensor Logs ==="
 echo ""
 
@@ -426,7 +310,7 @@ else
     cat /output/events.jsonl 2>/dev/null || echo "(none)"
     echo ""
     echo "Test app logs:"
-    $OC logs -n oisp-sensor -l app.kubernetes.io/name=test-app --tail=30 || true
+    kubectl logs -n oisp-sensor -l app.kubernetes.io/name=test-app --tail=30 || true
 fi
 
 exit $RESULT
@@ -434,38 +318,4 @@ EOF
 
 RUN chmod +x /test/run-test.sh
 
-# The entrypoint starts dockerd and then runs our test
-COPY <<'ENTRYPOINT' /entrypoint.sh
-#!/bin/bash
-set -e
-
-# Start Docker daemon in background, redirect logs to file
-dockerd-entrypoint.sh > /var/log/docker.log 2>&1 &
-
-# Wait for docker socket to be available
-echo "Waiting for Docker daemon to start..."
-for i in $(seq 1 60); do
-    if [ -S /var/run/docker.sock ]; then
-        # Socket exists, wait a bit more for daemon to be fully ready
-        sleep 2
-        if docker info >/dev/null 2>&1; then
-            echo "Docker daemon is ready! (took ${i}s)"
-            break
-        fi
-    fi
-    if [ "$i" -eq 60 ]; then
-        echo "ERROR: Docker daemon failed to start after 60s"
-        echo "=== Docker logs ==="
-        cat /var/log/docker.log
-        exit 1
-    fi
-    sleep 1
-done
-
-# Run our test
-exec /test/run-test.sh
-ENTRYPOINT
-
-RUN chmod +x /entrypoint.sh
-
-CMD ["/entrypoint.sh"]
+CMD ["/test/run-test.sh"]

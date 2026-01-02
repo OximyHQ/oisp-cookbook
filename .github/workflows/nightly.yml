@@ -106,9 +106,9 @@ jobs:
           echo "Running: $COOKBOOK"
 
           # All tests need --privileged for eBPF/sslsniff to work
-          # Kubernetes tests also need docker socket for k3d
-          if [[ "$COOKBOOK" == kubernetes/* ]]; then
-            docker run --rm --privileged \
+          # Kubernetes/OpenShift tests need docker socket + host network for k3d API access
+          if [[ "$COOKBOOK" == kubernetes/* ]] || [[ "$COOKBOOK" == openshift/* ]]; then
+            docker run --rm --privileged --network host \
               -e OPENAI_API_KEY="$OPENAI_API_KEY" \
               -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
               -v /var/run/docker.sock:/var/run/docker.sock \

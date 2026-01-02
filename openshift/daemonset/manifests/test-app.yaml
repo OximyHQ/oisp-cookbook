@@ -1,7 +1,5 @@
 # Test Application for validating OISP Sensor captures
-#
-# This Job deploys a Python container that makes OpenAI API calls.
-# The sensor should capture these calls and produce ai.request/ai.response events.
+# Uses curl which links against system libssl.so (capturable by sslsniff)
 #
 # Prerequisites:
 # 1. Sensor DaemonSet must be running
@@ -32,64 +30,45 @@ spec:
 
       containers:
         - name: app
-          # Using official Python image
-          image: python:3.11-slim
-
+          # Use debian which has curl linked against system libssl.so
+          image: debian:bookworm-slim
           command:
             - /bin/bash
             - -c
             - |
-              echo "Installing OpenAI SDK..."
-              pip install -q openai
+              set -e
 
-              echo "Running test application..."
-              python3 << 'EOF'
-              import os
-              import sys
-              from openai import OpenAI
+              # Install curl (uses system libssl)
+              apt-get update -qq && apt-get install -qq -y curl jq > /dev/null
 
-              # Initialize client
-              api_key = os.environ.get("OPENAI_API_KEY")
-              if not api_key:
-                  print("ERROR: OPENAI_API_KEY not set")
-                  sys.exit(1)
+              echo "Making OpenAI API call with curl..."
+              echo "curl version: $(curl --version | head -1)"
 
-              client = OpenAI(api_key=api_key)
+              # Check which SSL library curl uses
+              echo "SSL libraries:"
+              ldd $(which curl) | grep -i ssl || echo "No SSL in ldd"
 
-              print("Making OpenAI API call...")
-              print("=" * 50)
+              # Make the API call
+              RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $OPENAI_API_KEY" \
+                -d '{
+                  "model": "gpt-4o-mini",
+                  "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}]
+                }')
 
-              try:
-                  response = client.chat.completions.create(
-                      model="gpt-4o-mini",
-                      messages=[
-                          {
-                              "role": "system",
-                              "content": "You are a helpful assistant. Be concise."
-                          },
-                          {
-                              "role": "user",
-                              "content": "Say hello in exactly 3 words."
-                          }
-                      ],
-                      max_tokens=50
-                  )
+              echo "Response received!"
+              echo "$RESPONSE" | jq -r '.choices[0].message.content' 2>/dev/null || echo "$RESPONSE"
 
-                  # Print response details
-                  print(f"Model: {response.model}")
-                  print(f"Response: {response.choices[0].message.content}")
-                  print(f"Finish reason: {response.choices[0].finish_reason}")
-                  print(f"Prompt tokens: {response.usage.prompt_tokens}")
-                  print(f"Completion tokens: {response.usage.completion_tokens}")
-                  print(f"Total tokens: {response.usage.total_tokens}")
-                  print("=" * 50)
-                  print("SUCCESS: OpenAI API call completed!")
+              # Make a second call to ensure we have enough events
+              echo ""
+              echo "Making second API call..."
+              curl -s https://api.openai.com/v1/models \
+                -H "Authorization: Bearer $OPENAI_API_KEY" \
+                | jq -r '.data[0].id' 2>/dev/null || echo "Second call done"
 
-              except Exception as e:
-                  print(f"ERROR: {e}")
-                  sys.exit(1)
-              EOF
-
+              echo ""
+              echo "Done!"
           env:
             - name: OPENAI_API_KEY
               valueFrom:

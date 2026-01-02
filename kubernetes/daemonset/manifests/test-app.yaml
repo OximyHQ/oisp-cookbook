@@ -1,5 +1,5 @@
 # Test application for validating sensor captures
-# This deploys a Job that makes OpenAI API calls and completes
+# Uses curl which links against system libssl.so (capturable by sslsniff)
 
 apiVersion: batch/v1
 kind: Job
@@ -19,30 +19,45 @@ spec:
       restartPolicy: Never
       containers:
         - name: app
-          image: python:3.11-slim
+          # Use debian which has curl linked against system libssl.so
+          image: debian:bookworm-slim
           command:
             - /bin/bash
             - -c
             - |
-              pip install -q openai
-              python3 << 'EOF'
-              import os
-              from openai import OpenAI
+              set -e
 
-              client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+              # Install curl (uses system libssl)
+              apt-get update -qq && apt-get install -qq -y curl jq > /dev/null
 
-              print("Making OpenAI API call...")
-              response = client.chat.completions.create(
-                  model="gpt-4o-mini",
-                  messages=[
-                      {"role": "user", "content": "Say hello in exactly 3 words."}
-                  ]
-              )
+              echo "Making OpenAI API call with curl..."
+              echo "curl version: $(curl --version | head -1)"
 
-              print(f"Response: {response.choices[0].message.content}")
-              print(f"Tokens: {response.usage.total_tokens}")
-              print("Done!")
-              EOF
+              # Check which SSL library curl uses
+              echo "SSL libraries:"
+              ldd $(which curl) | grep -i ssl || echo "No SSL in ldd"
+
+              # Make the API call
+              RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $OPENAI_API_KEY" \
+                -d '{
+                  "model": "gpt-4o-mini",
+                  "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}]
+                }')
+
+              echo "Response received!"
+              echo "$RESPONSE" | jq -r '.choices[0].message.content' 2>/dev/null || echo "$RESPONSE"
+
+              # Make a second call to ensure we have enough events
+              echo ""
+              echo "Making second API call..."
+              curl -s https://api.openai.com/v1/models \
+                -H "Authorization: Bearer $OPENAI_API_KEY" \
+                | jq -r '.data[0].id' 2>/dev/null || echo "Second call done"
+
+              echo ""
+              echo "Done!"
           env:
             - name: OPENAI_API_KEY
               valueFrom:

@@ -121,15 +121,14 @@ jobs:
           echo "Running: $COOKBOOK"
 
           # All tests need --privileged for eBPF/sslsniff to work
-          # Kubernetes/OpenShift tests need docker socket + host network for k3d API access
+          # Kubernetes/OpenShift tests are manifest validation only (no eBPF needed)
           if [[ "$COOKBOOK" == kubernetes/* ]] || [[ "$COOKBOOK" == openshift/* ]]; then
-            docker run --rm --privileged --network host \
-              -e OPENAI_API_KEY="$OPENAI_API_KEY" \
-              -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-              -v /var/run/docker.sock:/var/run/docker.sock \
+            # Manifest validation - lightweight, no special privileges needed
+            docker run --rm \
               -v "$(pwd)/output:/output" \
               "$IMAGE_NAME"
           else
+            # E2E tests need privileged for eBPF
             docker run --rm --privileged \
               -e OPENAI_API_KEY="$OPENAI_API_KEY" \
               -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \

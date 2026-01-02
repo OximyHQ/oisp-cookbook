@@ -1,9 +1,11 @@
 # Test Dockerfile for Kubernetes DaemonSet deployment
 #
-# This test builds the sensor, creates a k3d cluster inside Docker,
-# deploys the DaemonSet, runs a test app, and validates captured events.
+# This test builds the sensor, and runs the k8s deployment test.
+# The k3d cluster setup is handled by the workflow (not inside container).
 #
-# Uses Docker-in-Docker (DinD) to run k3d inside the container.
+# Two modes:
+# 1. CI mode: k3d runs on host, this container mounts docker socket & kubeconfig
+# 2. Local mode: Can run with DinD for local testing
 #
 # Prerequisites:
 #   Clone with submodules: git clone --recurse-submodules <repo>
@@ -69,7 +71,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/oisp-sensor /usr/local/bin/oisp-sensor
 
 # =============================================================================
-# Stage 3: Build sensor Docker image (for k3d import)
+# Stage 3: Build sensor Docker image (exported as tar for CI to load)
 # =============================================================================
 FROM debian:trixie-slim AS sensor-image
 
@@ -94,18 +96,18 @@ ENTRYPOINT ["oisp-sensor"]
 CMD ["record", "--output", "/output/events.jsonl"]
 
 # =============================================================================
-# Stage 4: Test runner with Docker-in-Docker + k3d
+# Stage 4: Test runner - lightweight, uses host's Docker/k3d
 # =============================================================================
-FROM docker:24-dind
+FROM ubuntu:24.04
 
 # Install dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y \
     bash \
     curl \
     jq \
     python3 \
-    py3-pip \
-    git
+    docker.io \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install kubectl
 RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
@@ -124,8 +126,7 @@ COPY oisp-cookbook/kubernetes/daemonset/manifests/ ./manifests/
 COPY oisp-cookbook/kubernetes/daemonset/expected-events.json .
 COPY --chmod=755 oisp-cookbook/shared/scripts/validate.py /scripts/
 
-# We need to save the sensor image and load it into k3d
-# Create a script to export the sensor image from the build stage
+# Save sensor image rootfs for building
 COPY --from=sensor-image / /sensor-rootfs/
 
 # Test script
@@ -141,8 +142,8 @@ mkdir -p /output
 
 # Check prerequisites
 echo "Checking prerequisites..."
-echo "kubectl version: $(kubectl version --client -o json | jq -r '.clientVersion.gitVersion')"
-echo "k3d version: $(k3d version | head -1)"
+echo "kubectl version: $(kubectl version --client -o json 2>/dev/null | jq -r '.clientVersion.gitVersion' 2>/dev/null || echo 'unknown')"
+echo "k3d version: $(k3d version 2>/dev/null | head -1 || echo 'not installed')"
 echo ""
 
 # Check API key
@@ -151,9 +152,14 @@ if [ -z "$OPENAI_API_KEY" ]; then
     exit 1
 fi
 
-# Docker should already be ready (started in entrypoint)
+# Check if docker is available (should be mounted from host)
 echo "Docker status:"
-docker info 2>/dev/null | grep -E "(Server Version|Storage Driver)" || echo "Docker not available"
+if docker info >/dev/null 2>&1; then
+    docker info 2>/dev/null | grep -E "(Server Version|Storage Driver)" || true
+else
+    echo "ERROR: Docker not available. Make sure docker socket is mounted."
+    exit 1
+fi
 echo ""
 
 # Build sensor image from the rootfs we copied
@@ -301,38 +307,4 @@ EOF
 
 RUN chmod +x /test/run-test.sh
 
-# The entrypoint starts dockerd and then runs our test
-COPY <<'ENTRYPOINT' /entrypoint.sh
-#!/bin/bash
-set -e
-
-# Start Docker daemon in background, redirect logs to file
-dockerd-entrypoint.sh > /var/log/docker.log 2>&1 &
-
-# Wait for docker socket to be available
-echo "Waiting for Docker daemon to start..."
-for i in $(seq 1 60); do
-    if [ -S /var/run/docker.sock ]; then
-        # Socket exists, wait a bit more for daemon to be fully ready
-        sleep 2
-        if docker info >/dev/null 2>&1; then
-            echo "Docker daemon is ready! (took ${i}s)"
-            break
-        fi
-    fi
-    if [ "$i" -eq 60 ]; then
-        echo "ERROR: Docker daemon failed to start after 60s"
-        echo "=== Docker logs ==="
-        cat /var/log/docker.log
-        exit 1
-    fi
-    sleep 1
-done
-
-# Run our test
-exec /test/run-test.sh
-ENTRYPOINT
-
-RUN chmod +x /entrypoint.sh
-
-CMD ["/entrypoint.sh"]
+CMD ["/test/run-test.sh"]

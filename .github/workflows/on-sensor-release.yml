@@ -55,8 +55,8 @@ jobs:
       - name: Discover cookbooks with Dockerfile.test
         id: discover
         run: |
-          # Find all cookbooks with Dockerfile.test (excludes kubernetes which has its own test)
-          COOKBOOKS=$(find . -name "Dockerfile.test" -not -path "./kubernetes/*" \
+          # Find all cookbooks with Dockerfile.test (including kubernetes)
+          COOKBOOKS=$(find . -name "Dockerfile.test" \
             -exec dirname {} \; | sed 's|^\./||' | sort | \
             jq -R -s -c 'split("\n")[:-1] | map({name: (.|gsub("/";"-")), path: .})')
           echo "cookbooks=$COOKBOOKS" >> $GITHUB_OUTPUT
@@ -119,11 +119,23 @@ jobs:
           mkdir -p output
 
           echo "Running: $COOKBOOK"
-          docker run --rm --privileged \
-            -e OPENAI_API_KEY="$OPENAI_API_KEY" \
-            -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-            -v "$(pwd)/output:/output" \
-            "$IMAGE_NAME"
+
+          # All tests need --privileged for eBPF/sslsniff to work
+          # Kubernetes tests also need docker socket for k3d
+          if [[ "$COOKBOOK" == kubernetes/* ]]; then
+            docker run --rm --privileged \
+              -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+              -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$(pwd)/output:/output" \
+              "$IMAGE_NAME"
+          else
+            docker run --rm --privileged \
+              -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+              -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+              -v "$(pwd)/output:/output" \
+              "$IMAGE_NAME"
+          fi
 
       - name: Upload logs on failure
         if: failure()

@@ -98,13 +98,32 @@ async def run_test_requests():
     print("=== Running Test Requests ===")
     print()
 
+    # Helper function with retry logic
+    async def make_request_with_retry(http_client, url, json_data, max_retries=3):
+        """Make HTTP request with retry logic for timeouts."""
+        for attempt in range(max_retries):
+            try:
+                response = await http_client.post(
+                    url,
+                    json=json_data,
+                    timeout=60.0,  # Increased timeout
+                )
+                return response
+            except httpx.ReadTimeout:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    print(f"  Timeout, retrying in {wait_time}s (attempt {attempt + 2}/{max_retries})...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+
     async with httpx.AsyncClient() as http_client:
         # Test 1: Simple chat
         print("Test 1: Simple chat request...")
-        response = await http_client.post(
+        response = await make_request_with_retry(
+            http_client,
             "http://localhost:8000/chat",
-            json={"message": "What is FastAPI? Answer in one sentence."},
-            timeout=30.0,
+            {"message": "What is FastAPI? Answer in one sentence."},
         )
         data = response.json()
         print(f"  Response: {data['response'][:100]}...")
@@ -113,13 +132,13 @@ async def run_test_requests():
 
         # Test 2: Custom system prompt
         print("Test 2: Custom system prompt...")
-        response = await http_client.post(
+        response = await make_request_with_retry(
+            http_client,
             "http://localhost:8000/chat",
-            json={
+            {
                 "message": "Say hello",
                 "system_prompt": "You are a pirate. Respond like a pirate.",
             },
-            timeout=30.0,
         )
         data = response.json()
         print(f"  Response: {data['response'][:100]}...")
